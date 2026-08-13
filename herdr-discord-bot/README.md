@@ -19,6 +19,12 @@ Owner-only slash commands, usable only inside your server:
 The bot also auto-creates its control channel the moment it's invited to your
 server (via the `GuildCreate` event) — no manual channel setup needed.
 
+Agent threads keep a raw, append-only terminal transcript for inspection. When
+an agent settles, the bot also posts its final prose reply as normal Discord
+Markdown; if the turn began with a message in that thread, the final reply is
+threaded directly to that message. Set `ANSWER_LINES` (default `120`, maximum
+`200`) to tune how much terminal history is considered for that final reply.
+
 `<target>` is a herdr **pane ID** (e.g. `wR:p2`, shown by `/agents`) or a
 substring of the agent's title/path (must be unambiguous).
 

@@ -19,6 +19,7 @@ const {
 } = require('discord.js');
 const herdr = require('./herdr');
 const { Dashboard } = require('./dashboard');
+const { extractAnswer } = require('./answer');
 
 // Always-available controls, pinned in each agent's thread. Blocked agents get
 // the answer buttons below; these work at any time, so a running agent can be
@@ -110,6 +111,16 @@ function codeBlock(text, max = 1850) {
   return '```\n' + (body.trim() || '(no output)') + '\n```';
 }
 
+// Keep a real final answer within Discord's 2,000-character message limit.
+// Prefer a word boundary when truncating so Markdown stays as readable as the
+// terminal capture allowed it to be.
+function answerText(text, max = 1850) {
+  const body = String(text || '').trim();
+  if (body.length <= max) return body;
+  const cut = body.lastIndexOf(' ', max - 1);
+  return `${body.slice(0, cut > max * 0.6 ? cut : max - 1).trimEnd()}…`;
+}
+
 function threadName(a) {
   const emoji = STATUS_EMOJI[a.status] || '⚪';
   const label = clampName(a.title) || a.cwd.split('/').pop() || a.paneId;
@@ -153,6 +164,8 @@ class Sync {
     this.renaming = new Set(); // panes with a rename in flight
     this.renameWant = new Map(); // paneId -> latest name we want
     this.replyTo = new Map(); // paneId -> message id to reply to (a question)
+    this.answers = new Map(); // paneId -> most recently posted final answer
+    this.answerLines = Math.min(Math.max(Number(process.env.ANSWER_LINES || 120), 1), 200);
     this.panelMsg = new Map(); // channelId -> its live panel message id
     this.panelSig = new Map(); // channelId -> last rendered signature
     this.swept = new Set(); // channels already cleaned of system noise
@@ -456,6 +469,7 @@ class Sync {
           if (SETTLED.has(a.status) && prev !== undefined) {
             this.outputAt.delete(a.paneId); // bypass the throttle
             await this.streamOutput(a).catch(() => {});
+            await this.#postAnswer(a, thread);
           }
           this.prev.set(a.paneId, a.status);
         } catch (e) {
@@ -485,6 +499,7 @@ class Sync {
       this.outputText.delete(paneId);
       this.outputAt.delete(paneId);
       this.typing.delete(paneId);
+      this.answers.delete(paneId);
       this.store?.deleteThreadForAgent?.(paneId);
     }
 
@@ -789,21 +804,50 @@ class Sync {
       this.parts.set(paneId, part);
       const body = addition.length > 1700 ? addition.slice(-1700) : addition;
 
-      // If this output is the first since you asked something, post it as a
-      // Discord reply to your message, so a question and its answer stay
-      // visibly paired the way a chat should.
-      const answering = this.replyTo.get(paneId);
       const payload = { content: header(part) + codeBlock(body, budget - 120) };
-      if (answering) {
-        payload.reply = { messageReference: answering, failIfNotExists: false };
-        this.replyTo.delete(paneId);
-      }
       const msg = await thread.send(payload);
       this.outBuf.set(paneId, { id: msg.id, text: body, part });
       this.outputMsg.set(paneId, msg.id);
       this.store?.setMeta?.('outputMsgs', Object.fromEntries(this.outputMsg));
     } catch (e) {
       this.log.error(`[sync] live output for ${paneId} failed:`, e.message);
+    }
+  }
+
+  // A terminal transcript is useful for diagnosis, but it is not a chat
+  // reply: tool cards, spinners and diffs overwhelm the one thing a human
+  // asked for. On a settled turn, extract and post only the agent's final
+  // prose. The raw stream above remains in the thread for full context.
+  async #postAnswer(agent, thread) {
+    let terminal;
+    try {
+      terminal = await herdr.readAgent(agent.paneId, this.answerLines);
+    } catch {
+      return;
+    }
+
+    const result = extractAnswer(terminal, { agent: agent.agent });
+    const body = answerText(result.answer);
+    if (!body || result.kind !== 'prose') return;
+    if (this.answers.get(agent.paneId) === body) return;
+
+    const payload = {
+      content: `🤖 **${clampName(agent.title) || agent.paneId}**\n${body}`,
+      // A model may mention @everyone or a role in its final answer. Never
+      // turn terminal text into a notification.
+      allowedMentions: { parse: [] },
+    };
+    const answering = this.replyTo.get(agent.paneId);
+    if (answering) {
+      payload.reply = { messageReference: answering, failIfNotExists: false };
+    }
+
+    try {
+      await thread.send(payload);
+      this.answers.set(agent.paneId, body);
+      if (answering) this.replyTo.delete(agent.paneId);
+    } catch (e) {
+      this.log.error(`[sync] final answer for ${agent.paneId} failed:`, e.message);
     }
   }
 
