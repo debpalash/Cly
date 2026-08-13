@@ -299,6 +299,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       await interaction.editReply(codeBlock(out.trim() || '(no output)'));
       return;
     }
+    if (action === 'status') {
+      await interaction.deferReply({ ephemeral: true });
+      const a = await herdr.getAgent(paneId);
+      const e = STATUS_EMOJI[a.status] || '⚪';
+      await interaction.editReply(
+        `${e} \`${a.paneId}\` **${a.agent}** · ${a.status}\n` +
+          `${a.title || '(no title)'}\n\`${a.cwd}\``,
+      );
+      return;
+    }
     const keys = BUTTON_KEYS[action];
     if (!keys) return;
     await interaction.deferReply({ ephemeral: true });

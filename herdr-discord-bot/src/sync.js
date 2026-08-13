@@ -20,6 +20,34 @@ const {
 const herdr = require('./herdr');
 const { Dashboard } = require('./dashboard');
 
+// Always-available controls, pinned in each agent's thread. Blocked agents get
+// the answer buttons below; these work at any time, so a running agent can be
+// interrupted without waiting for it to ask something.
+function agentControls(paneId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`interrupt:${paneId}`)
+      .setLabel('Interrupt')
+      .setEmoji('⛔')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId(`approve:${paneId}`)
+      .setLabel('Enter')
+      .setEmoji('↩️')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`read:${paneId}`)
+      .setLabel('Read output')
+      .setEmoji('📄')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`status:${paneId}`)
+      .setLabel('Status')
+      .setEmoji('🔎')
+      .setStyle(ButtonStyle.Secondary),
+  );
+}
+
 // Buttons attached to a blocked agent so it can be answered from Discord.
 function blockedActions(paneId) {
   return new ActionRowBuilder().addComponents(
@@ -119,6 +147,9 @@ class Sync {
     this.outputLines = Number(process.env.OUTPUT_LINES || 25);
     this.typing = new Set(); // paneIds currently shown as "typing"
     this.typingTimer = null;
+    this.lastKeepAlive = 0; // last un-archive sweep
+    this.keepAliveMs = Number(process.env.KEEPALIVE_MS || 300000); // 5 min
+    this.parts = new Map(); // paneId -> last transcript part number
     this.renaming = new Set(); // panes with a rename in flight
     this.renameWant = new Map(); // paneId -> latest name we want
     this.replyTo = new Map(); // paneId -> message id to reply to (a question)
@@ -208,6 +239,8 @@ class Sync {
       for (const [k, v] of Object.entries(om)) this.outputMsg.set(k, v);
       const pm = this.store.getMeta?.('panelMsgs') || {};
       for (const [k, v] of Object.entries(pm)) this.panelMsg.set(k, v);
+      const pt = this.store.getMeta?.('parts') || {};
+      for (const [k, v] of Object.entries(pt)) this.parts.set(k, v);
     } catch (e) {
       this.log.error('[sync] could not load state:', e.message);
     }
@@ -221,6 +254,7 @@ class Sync {
       }
       this.store.setMeta?.('statuses', Object.fromEntries(this.prev));
       this.store.setMeta?.('threadNames', Object.fromEntries(this.names));
+      this.store.setMeta?.('parts', Object.fromEntries(this.parts));
     } catch (e) {
       this.log.error('[sync] persist failed:', e.message);
     }
@@ -303,7 +337,9 @@ class Sync {
         content:
           '💬 **Type any message here to send it as a prompt to this agent.** ' +
           'Prefix with `//` to leave a note without prompting.',
+        components: [agentControls(agent.paneId)],
       })
+      .then((m) => m.pin().catch(() => {}))
       .catch((e) => this.log.error('[sync] intro send failed:', e.message));
 
     this.log.info?.(`[sync] created thread for ${agent.paneId}`);
@@ -452,6 +488,12 @@ class Sync {
       this.store?.deleteThreadForAgent?.(paneId);
     }
 
+    // Discord archives a thread after 7 days without activity — and 7 days is
+    // its maximum. Most agents sit idle, so without this their threads quietly
+    // drop out of the sidebar and the panel decays with no error anywhere.
+    // Keep every live agent's thread un-archived.
+    await this.#keepThreadsAlive(seen);
+
     // Refresh the live panel with the full picture.
     if (this.dashboard) {
       await this.dashboard.render(agents, this.threads).catch(() => {});
@@ -475,6 +517,31 @@ class Sync {
     } catch (e) {
       this.log.error('[sync] sweep failed:', e.message);
     }
+  }
+
+  // Un-archive threads whose agent is still alive. Checked at most once every
+  // few minutes: archiving is a 7-day clock, so this never needs to be eager,
+  // and each check costs an API call per thread.
+  async #keepThreadsAlive(livePanes) {
+    const now = Date.now();
+    if (now - this.lastKeepAlive < this.keepAliveMs) return;
+    this.lastKeepAlive = now;
+
+    let revived = 0;
+    for (const paneId of livePanes) {
+      const threadId = this.threads.get(paneId);
+      if (!threadId) continue;
+      try {
+        const t = await this.guild.channels.fetch(threadId).catch(() => null);
+        if (t?.archived) {
+          await t.setArchived(false);
+          revived++;
+        }
+      } catch {
+        /* a thread we cannot revive is picked up on the next pass */
+      }
+    }
+    if (revived) this.log.info?.(`[sync] un-archived ${revived} live agent threads`);
   }
 
   // Rename a thread out of band. Only the newest requested name matters, so a
@@ -716,7 +783,10 @@ class Sync {
       }
 
       // Start a new part: either the first, or the previous one filled up.
-      const part = (buf?.part || 0) + 1;
+      // Numbering continues across restarts so a transcript does not reset to
+      // "part 1" every redeploy.
+      const part = (buf?.part ?? this.parts.get(paneId) ?? 0) + 1;
+      this.parts.set(paneId, part);
       const body = addition.length > 1700 ? addition.slice(-1700) : addition;
 
       // If this output is the first since you asked something, post it as a
