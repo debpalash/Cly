@@ -1,0 +1,18 @@
+[Unit]
+Description=herdr Discord bot (ChatOps bridge to herdr agents)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/github/Cly/herdr-discord-bot
+# Absolute node path (nvm is not on the user-manager PATH). PATH also includes
+# ~/.local/bin so the bot can find the `herdr` binary it shells out to.
+Environment=PATH=%h/.config/nvm/versions/node/v26.7.0/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NODE_ENV=production
+ExecStart=%h/.config/nvm/versions/node/v26.7.0/bin/node src/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

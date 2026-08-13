@@ -1,2 +1,9 @@
 # Reference clones for research — not part of this project
 research/
+herdr-discord-bot/node_modules/
+herdr-discord-bot/.env
+herdr-discord-bot/data/
+
+# never commit secrets
+.env
+**/.env

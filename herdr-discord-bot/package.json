@@ -1,0 +1,18 @@
+{
+  "name": "herdr-discord-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Control herdr agents from Discord (owner-locked ChatOps bridge)",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy": "node src/deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
