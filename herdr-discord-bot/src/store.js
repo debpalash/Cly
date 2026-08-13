@@ -103,6 +103,13 @@ class Store {
       return this.data;
     }
 
+    if (!text.trim()) {
+      // Zero-length file: an interrupted write, not corruption worth keeping.
+      this.data = emptyData();
+      this.loaded = true;
+      return this.data;
+    }
+
     try {
       this.data = normalizeData(JSON.parse(text));
     } catch (err) {
@@ -128,7 +135,7 @@ class Store {
       return this.data;
     }
     try {
-      this.data = normalizeData(JSON.parse(text));
+      this.data = text.trim() ? normalizeData(JSON.parse(text)) : emptyData();
     } catch (err) {
       console.warn(`[store] ${this.file} is corrupt (${err.message}) — starting fresh`);
       this.data = emptyData();
