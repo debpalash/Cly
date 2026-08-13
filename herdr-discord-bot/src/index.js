@@ -17,9 +17,17 @@ const {
   EmbedBuilder,
   ChannelType,
   Partials,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require('discord.js');
 
+const path = require('node:path');
+
 const herdr = require('./herdr');
+
+// Where this bot itself lives — /run refuses to launch a second copy of it.
+const SELF_ROOT = path.resolve(__dirname, '..');
 
 const {
   DISCORD_TOKEN,
@@ -307,6 +315,103 @@ async function handleScreenshot(interaction) {
   }
 }
 
+// Walk a running app through real interactions and report each step. The URL
+// resolves the same way /screenshot does, so a bare port works.
+async function handleFlow(interaction) {
+  const browser = require('./browser');
+  const raw = (interaction.options.getString('url', true) || '').trim();
+  const stepText = interaction.options.getString('steps', true);
+  await interaction.deferReply();
+
+  let url = raw;
+  if (/^\d+$/.test(raw)) url = `http://127.0.0.1:${raw}/`;
+  else if (!/^https?:\/\//i.test(raw)) url = `http://${raw}`;
+
+  try {
+    const run = await browser.drive(url, stepText);
+    const lines = run.steps.map(
+      (s) => `${s.ok ? '✅' : '❌'} \`${s.raw}\` — ${s.detail} · ${s.ms}ms`,
+    );
+    const skipped = browser.parseSteps(stepText).length - run.steps.length;
+    if (skipped > 0) lines.push(`⏭️ ${skipped} step${skipped === 1 ? '' : 's'} not reached`);
+
+    const problems = [
+      ...run.consoleErrors.map((e) => `⚠️ ${e}`),
+      ...run.failedRequests.map((e) => `🚫 ${e}`),
+    ].slice(0, 5);
+
+    const embed = new EmbedBuilder()
+      .setTitle(`${run.ok ? '✅' : '❌'} ${run.title || url}`)
+      .setColor(run.ok ? 0x57f287 : 0xed4245)
+      .setDescription(lines.join('\n').slice(0, 4000))
+      .setFooter({ text: `${url} · ${run.ms}ms` });
+    if (problems.length) {
+      embed.addFields({ name: 'Page problems', value: problems.join('\n').slice(0, 1000) });
+    }
+
+    await interaction.editReply({
+      embeds: [embed],
+      files: [{ attachment: run.png, name: 'flow.png' }],
+    });
+  } catch (e) {
+    await interaction.editReply(`⚠️ Could not run that flow against ${url}: ${e.message}`);
+  }
+}
+
+// --- closing agents ---------------------------------------------------------
+// Everything that starts an agent lives in Discord, so stopping one should too.
+// Closing the workspace rather than the pane when it is the last pane keeps the
+// sidebar from filling with empty shells.
+async function closeAgentPane(agent) {
+  const extra = require('./herdr-extra');
+  const ws = agent.workspaceId
+    ? await extra.getWorkspace(agent.workspaceId).catch(() => null)
+    : null;
+  if (ws && ws.paneCount <= 1) {
+    await extra.closeWorkspace(agent.workspaceId);
+    return `workspace \`${agent.workspaceId}\``;
+  }
+  await extra.closePane(agent.paneId);
+  return `pane \`${agent.paneId}\``;
+}
+
+async function handleClose(interaction) {
+  const target = interaction.options.getString('target');
+  let paneId = target;
+  if (!paneId && sync) paneId = sync.paneForThread(interaction.channelId);
+  if (!paneId) {
+    await interaction.reply({
+      content: '⚠️ Run this inside an agent thread, or pass `target:` with a pane id.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  const a = await herdr.resolveTarget(paneId);
+
+  // An idle agent has nothing to lose. One mid-task does, so make that a
+  // deliberate second action rather than a single mistyped command.
+  if (a.status === 'working' || a.status === 'blocked') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`closeok:${a.paneId}`)
+        .setLabel(`Close ${a.paneId} anyway`)
+        .setStyle(ButtonStyle.Danger),
+    );
+    await interaction.editReply({
+      content:
+        `⚠️ \`${a.paneId}\` **${a.agent}** is ${a.status} — ${a.title || 'no title'}\n` +
+        'Closing now discards whatever it is in the middle of.',
+      components: [row],
+    });
+    return;
+  }
+
+  const what = await closeAgentPane(a);
+  await interaction.editReply(`⚫ Closed ${what} — \`${a.paneId}\` **${a.agent}** was ${a.status}.`);
+}
+
 // --- project run / test -----------------------------------------------------
 // Resolve which project a command refers to: an explicit path, else the project
 // behind the channel it was typed in.
@@ -394,7 +499,8 @@ async function handleRun(interaction) {
     return;
   }
   const info = detect(root);
-  const cmd = interaction.options.getString('command') || info.run;
+  const explicit = interaction.options.getString('command');
+  const cmd = explicit || info.run;
   if (!cmd) {
     await interaction.editReply(`⚠️ No run command found for **${info.name}**.`);
     return;
@@ -404,6 +510,17 @@ async function handleRun(interaction) {
   // running and its output streams into Discord like any other agent. Start it
   // where its manifest lives, which may be a subproject of the repo root.
   const cwd = info.root || root;
+
+  // In this repo the detected run command starts this very bot. A second copy
+  // on the same token would double every post in the server, so don't offer to
+  // do it by accident — an explicit `command:` still runs.
+  if (!explicit && path.resolve(cwd) === SELF_ROOT) {
+    await interaction.editReply(
+      `⚠️ \`${cmd}\` in **${info.name}** is this bot itself — a second copy on the same ` +
+        'token would double every message here. Pass `command:` if you meant something else.',
+    );
+    return;
+  }
   const ws = await extra.createWorkspace({ cwd, label: `run ${info.name}`, focus: false });
   const paneId = ws.pane.paneId || ws.pane.id;
   await extra.runInPane(paneId, cmd);
@@ -476,6 +593,8 @@ const HANDLERS = {
   agents: handleAgents,
   handoff: handleHandoff,
   screenshot: handleScreenshot,
+  flow: handleFlow,
+  close: handleClose,
   test: handleTest,
   run: handleRun,
   pr: handlePR,
@@ -725,6 +844,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `${e} \`${a.paneId}\` **${a.agent}** · ${a.status}\n` +
           `${a.title || '(no title)'}\n\`${a.cwd}\``,
       );
+      return;
+    }
+    if (action === 'closeok') {
+      await interaction.deferReply({ ephemeral: true });
+      const a = await herdr.resolveTarget(paneId);
+      const what = await closeAgentPane(a);
+      await interaction.editReply(`⚫ Closed ${what} — \`${a.paneId}\` **${a.agent}**.`);
       return;
     }
     const keys = BUTTON_KEYS[action];

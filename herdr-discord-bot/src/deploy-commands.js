@@ -93,6 +93,29 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('flow')
+    .setDescription('Drive a running app through real interactions and report each step')
+    .addStringOption((o) =>
+      o
+        .setName('url')
+        .setDescription('URL or port, e.g. 5173 or http://localhost:5173')
+        .setRequired(true),
+    )
+    .addStringOption((o) =>
+      o
+        .setName('steps')
+        .setDescription('Semicolon-separated: click Login; type #email me@x.com; expect Welcome')
+        .setRequired(true),
+    ),
+
+  new SlashCommandBuilder()
+    .setName('close')
+    .setDescription('Close an agent (defaults to the one whose thread you are in)')
+    .addStringOption((o) =>
+      o.setName('target').setDescription('Pane id, e.g. wQ:p3 (defaults to this thread)'),
+    ),
+
+  new SlashCommandBuilder()
     .setName('pr')
     .setDescription('Open pull requests for this project')
     .addStringOption((o) =>

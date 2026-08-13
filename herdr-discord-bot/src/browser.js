@@ -220,6 +220,188 @@ async function capture(url, { fullPage = true, waitMs = 1200 } = {}) {
   });
 }
 
+// --- driving a page, not just photographing it ------------------------------
+//
+// A step is one verb and its argument, written the way you would say it:
+//
+//   goto <url>            navigate mid-flow
+//   click <text|css>      visible text first, CSS selector as a fallback
+//   type <css> <text>     focus that field and type (selector = first token)
+//   wait <ms|text>        a number sleeps; anything else waits for that text
+//   expect <text>         fail the step unless the page shows it
+//
+// Steps run in order and stop at the first failure, because every later step
+// was written assuming the earlier ones worked.
+
+const STEP_TIMEOUT_MS = 10000;
+
+function parseSteps(text) {
+  return String(text || '')
+    .split(/\s*;\s*/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((raw) => {
+      const m = raw.match(/^(\w+)\s*(.*)$/s);
+      return { raw, verb: (m?.[1] || '').toLowerCase(), arg: (m?.[2] || '').trim() };
+    });
+}
+
+// Serialised into the page: find by visible text, then by CSS. Text wins
+// because that is how a person describes a button they can see.
+const FIND_FN = `function(needle){
+  var all = Array.from(document.querySelectorAll('button,a,[role="button"],input,textarea,select,label,summary'));
+  var hit = all.find(function(el){
+    var t = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+    return t && t.toLowerCase().indexOf(needle.toLowerCase()) >= 0;
+  });
+  if(!hit){ try { hit = document.querySelector(needle); } catch(e) { hit = null; } }
+  if(!hit) return null;
+  hit.scrollIntoView({block:'center'});
+  var r = hit.getBoundingClientRect();
+  return {x: r.left + r.width/2, y: r.top + r.height/2, tag: hit.tagName.toLowerCase(),
+          label: (hit.innerText || hit.value || '').trim().slice(0,40)};
+}`;
+
+async function pageText(cdp) {
+  const r = await cdp
+    .send('Runtime.evaluate', {
+      expression: 'document.body ? document.body.innerText : ""',
+      returnByValue: true,
+    })
+    .catch(() => null);
+  return r?.result?.value || '';
+}
+
+async function runStep(cdp, { verb, arg }) {
+  if (verb === 'goto') {
+    await cdp.send('Page.navigate', { url: arg });
+    await new Promise((r) => setTimeout(r, 1500));
+    return `at ${arg}`;
+  }
+
+  if (verb === 'wait') {
+    const ms = Number(arg);
+    if (Number.isFinite(ms) && ms > 0) {
+      await new Promise((r) => setTimeout(r, Math.min(ms, STEP_TIMEOUT_MS)));
+      return `waited ${ms}ms`;
+    }
+    const deadline = Date.now() + STEP_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if ((await pageText(cdp)).toLowerCase().includes(arg.toLowerCase())) return `saw "${arg}"`;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error(`"${arg}" never appeared`);
+  }
+
+  if (verb === 'expect') {
+    const text = await pageText(cdp);
+    if (!text.toLowerCase().includes(arg.toLowerCase())) {
+      throw new Error(`page does not show "${arg}"`);
+    }
+    return `found "${arg}"`;
+  }
+
+  if (verb === 'click') {
+    const found = await cdp
+      .send('Runtime.evaluate', {
+        expression: `(${FIND_FN})(${JSON.stringify(arg)})`,
+        returnByValue: true,
+      })
+      .then((r) => r.result?.value);
+    if (!found) throw new Error(`nothing matching "${arg}"`);
+    for (const type of ['mousePressed', 'mouseReleased']) {
+      await cdp.send('Input.dispatchMouseEvent', {
+        type,
+        x: found.x,
+        y: found.y,
+        button: 'left',
+        clickCount: 1,
+      });
+    }
+    await new Promise((r) => setTimeout(r, 600));
+    return `clicked ${found.tag}${found.label ? ` "${found.label}"` : ''}`;
+  }
+
+  if (verb === 'type') {
+    const [selector, ...rest] = arg.split(/\s+/);
+    const value = rest.join(' ');
+    const ok = await cdp
+      .send('Runtime.evaluate', {
+        expression: `(function(){
+          var el = null;
+          try { el = document.querySelector(${JSON.stringify(selector)}); } catch(e) {}
+          if(!el) return false;
+          el.scrollIntoView({block:'center'});
+          el.focus();
+          return true;
+        })()`,
+        returnByValue: true,
+      })
+      .then((r) => r.result?.value);
+    if (!ok) throw new Error(`no field matching "${selector}"`);
+    // insertText goes through the same path as a real keystroke, so framework
+    // inputs see the change; setting .value directly would not fire anything.
+    await cdp.send('Input.insertText', { text: value });
+    await new Promise((r) => setTimeout(r, 300));
+    return `typed into ${selector}`;
+  }
+
+  throw new Error(`unknown step "${verb}"`);
+}
+
+// Walk a URL through a list of steps and report what each one did.
+async function drive(url, stepText, { waitMs = 1500 } = {}) {
+  const steps = parseSteps(stepText);
+  if (!steps.length) throw new Error('no steps to run');
+
+  return withBrowser(async (cdp) => {
+    await cdp.send('Page.enable');
+    await cdp.send('Runtime.enable');
+    await cdp.send('Log.enable').catch(() => {});
+    await cdp.send('Network.enable').catch(() => {});
+
+    const started = Date.now();
+    await cdp.send('Page.navigate', { url });
+    await new Promise((r) => setTimeout(r, waitMs));
+
+    const results = [];
+    for (const step of steps) {
+      const at = Date.now();
+      try {
+        const detail = await runStep(cdp, step);
+        results.push({ raw: step.raw, ok: true, detail, ms: Date.now() - at });
+      } catch (e) {
+        results.push({ raw: step.raw, ok: false, detail: e.message, ms: Date.now() - at });
+        break; // later steps assumed this one worked
+      }
+    }
+
+    const title = await cdp
+      .send('Runtime.evaluate', { expression: 'document.title', returnByValue: true })
+      .then((r) => r.result?.value)
+      .catch(() => null);
+    const shot = await cdp.send('Page.captureScreenshot', { format: 'png' });
+
+    return {
+      url,
+      title,
+      ok: results.every((r) => r.ok),
+      steps: results,
+      png: Buffer.from(shot.data, 'base64'),
+      ms: Date.now() - started,
+      consoleErrors: cdp.events
+        .filter((e) => e.method === 'Log.entryAdded' && e.params?.entry?.level === 'error')
+        .map((e) => e.params.entry.text)
+        .slice(0, 10),
+      failedRequests: cdp.events
+        .filter((e) => e.method === 'Network.loadingFailed')
+        .map((e) => e.params?.errorText)
+        .filter(Boolean)
+        .slice(0, 10),
+    };
+  });
+}
+
 // Which local ports are actually serving HTTP right now.
 function listeningPorts() {
   return new Promise((resolve) => {
@@ -238,4 +420,4 @@ function listeningPorts() {
   });
 }
 
-module.exports = { capture, withBrowser, findBrowser, listeningPorts, CDP };
+module.exports = { capture, drive, parseSteps, withBrowser, findBrowser, listeningPorts, CDP };
