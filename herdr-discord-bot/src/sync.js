@@ -119,6 +119,9 @@ class Sync {
     this.outputLines = Number(process.env.OUTPUT_LINES || 25);
     this.typing = new Set(); // paneIds currently shown as "typing"
     this.typingTimer = null;
+    this.renaming = new Set(); // panes with a rename in flight
+    this.renameWant = new Map(); // paneId -> latest name we want
+    this.replyTo = new Map(); // paneId -> message id to reply to (a question)
     this.panelMsg = new Map(); // channelId -> its live panel message id
     this.panelSig = new Map(); // channelId -> last rendered signature
     this.swept = new Set(); // channels already cleaned of system noise
@@ -405,14 +408,11 @@ class Sync {
               content: `${pe} → ${ce} **${a.status}**${prev ? ` (was ${prev})` : ''}`,
               components: a.status === 'blocked' ? [blockedActions(a.paneId)] : [],
             });
-            // rename thread so the sidebar reflects live status
-            if (thread.name !== want) {
-              await thread.setName(want).catch(() => {});
-              // Discord logs every rename in the thread itself; with a status in
-              // the name that is one noise line per transition. Drop them.
-              this.#sweepRenames(thread).catch(() => {});
-            }
-            this.names.set(a.paneId, want);
+            // Rename the thread so the sidebar reflects live status — but never
+            // await it. Discord allows only ~2 thread renames per 10 minutes,
+            // and discord.js waits out that limit, which would hold up this
+            // agent's status messages behind a purely cosmetic change.
+            if (thread.name !== want) this.#renameLater(thread, want, a.paneId);
           }
           // On settle, make sure the live output message reflects the final
           // state. Streaming already keeps it current mid-run, so this just
@@ -475,6 +475,32 @@ class Sync {
     } catch (e) {
       this.log.error('[sync] sweep failed:', e.message);
     }
+  }
+
+  // Rename a thread out of band. Only the newest requested name matters, so a
+  // rename already in flight for this pane is simply superseded — that keeps us
+  // from spending the scarce rename budget on stale intermediate states.
+  #renameLater(thread, want, paneId) {
+    this.renameWant.set(paneId, want);
+    if (this.renaming.has(paneId)) return;
+    this.renaming.add(paneId);
+
+    (async () => {
+      try {
+        // Let rapid transitions settle before spending a rename.
+        await new Promise((r) => setTimeout(r, 1500));
+        const target = this.renameWant.get(paneId);
+        if (!target || thread.name === target) return;
+        await thread.setName(target);
+        this.names.set(paneId, target);
+        await this.#sweepRenames(thread);
+      } catch {
+        // Rate limited or gone: drop the recorded name so a later tick retries.
+        this.names.delete(paneId);
+      } finally {
+        this.renaming.delete(paneId);
+      }
+    })();
   }
 
   // Remove the "changed the channel name" notices Discord posts inside a thread
@@ -692,7 +718,17 @@ class Sync {
       // Start a new part: either the first, or the previous one filled up.
       const part = (buf?.part || 0) + 1;
       const body = addition.length > 1700 ? addition.slice(-1700) : addition;
-      const msg = await thread.send({ content: header(part) + codeBlock(body, budget - 120) });
+
+      // If this output is the first since you asked something, post it as a
+      // Discord reply to your message, so a question and its answer stay
+      // visibly paired the way a chat should.
+      const answering = this.replyTo.get(paneId);
+      const payload = { content: header(part) + codeBlock(body, budget - 120) };
+      if (answering) {
+        payload.reply = { messageReference: answering, failIfNotExists: false };
+        this.replyTo.delete(paneId);
+      }
+      const msg = await thread.send(payload);
       this.outBuf.set(paneId, { id: msg.id, text: body, part });
       this.outputMsg.set(paneId, msg.id);
       this.store?.setMeta?.('outputMsgs', Object.fromEntries(this.outputMsg));
@@ -704,6 +740,14 @@ class Sync {
   // Attach the live dashboard to a channel (normally #agent-control).
   attachDashboard(channel) {
     this.dashboard = new Dashboard({ channel, store: this.store, log: this.log });
+  }
+
+  // Remember that this Discord message asked the agent something, so the reply
+  // can be attached to it. Also force the next output through the throttle so
+  // the answer appears promptly rather than up to a window later.
+  expectReply(paneId, messageId) {
+    this.replyTo.set(paneId, messageId);
+    this.outputAt.delete(paneId);
   }
 
   // Is this channel id a thread we own? -> returns the paneId it maps to.

@@ -265,6 +265,8 @@ client.on(Events.MessageCreate, async (message) => {
     if (!text || text.startsWith('//')) return;
 
     await message.react('📨').catch(() => {});
+    // Pair the answer with the question: the agent's next output replies here.
+    sync.expectReply(paneId, message.id);
     await herdr.promptAgent(paneId, text);
     await message.react('✅').catch(() => {});
   } catch (e) {
