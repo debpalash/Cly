@@ -109,6 +109,60 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('queue')
+    .setDescription('What is waiting for this agent (prompts sent while it was busy)')
+    .addStringOption((o) =>
+      o.setName('target').setDescription('Pane id (defaults to this thread)'),
+    )
+    .addBooleanOption((o) => o.setName('clear').setDescription('Drop everything queued')),
+
+  new SlashCommandBuilder()
+    .setName('worktree')
+    .setDescription('Isolated checkouts so two agents can work one repo at once')
+    .addSubcommand((s) =>
+      s
+        .setName('new')
+        .setDescription('Create a worktree, open it as a workspace, optionally start an agent')
+        .addStringOption((o) =>
+          o.setName('branch').setDescription('Branch to create/check out').setRequired(true),
+        )
+        .addStringOption((o) => o.setName('base').setDescription('Branch to start from'))
+        .addStringOption((o) =>
+          o.setName('project').setDescription('Absolute path (inferred from the channel if omitted)'),
+        )
+        .addStringOption((o) =>
+          o
+            .setName('agent')
+            .setDescription('Start this agent inside the new worktree')
+            .addChoices(
+              { name: 'claude', value: 'claude' },
+              { name: 'codex', value: 'codex' },
+              { name: 'opencode', value: 'opencode' },
+              { name: 'gemini', value: 'gemini' },
+            ),
+        ),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('list')
+        .setDescription('Worktrees for this project')
+        .addStringOption((o) =>
+          o.setName('project').setDescription('Absolute path (inferred from the channel if omitted)'),
+        ),
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('remove')
+        .setDescription('Remove a worktree and close its workspace')
+        .addStringOption((o) =>
+          o.setName('workspace').setDescription('Workspace id, e.g. wK').setRequired(true),
+        )
+        .addBooleanOption((o) =>
+          o.setName('force').setDescription('Remove even with uncommitted changes'),
+        ),
+    ),
+
+  new SlashCommandBuilder()
     .setName('close')
     .setDescription('Close an agent (defaults to the one whose thread you are in)')
     .addStringOption((o) =>

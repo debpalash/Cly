@@ -125,12 +125,15 @@ function channelNameForWorkspace(wsId, agents) {
 }
 
 class Sync {
-  constructor({ client, guildId, store, categoryName = 'herdr', log = console }) {
+  constructor({ client, guildId, store, categoryName = 'herdr', log = console, onSettled }) {
     this.client = client;
     this.guildId = guildId;
     this.store = store;
     this.categoryName = categoryName;
     this.log = log;
+    // Called with (paneId, thread) each time an agent stops working. The queue
+    // uses it to hand over whatever was typed while the agent was busy.
+    this.onSettled = onSettled || null;
     this.timer = null;
     this.prev = new Map(); // paneId -> status
     this.threads = new Map(); // paneId -> threadId
@@ -522,6 +525,7 @@ class Sync {
       }
 
       for (const a of list) {
+        trace(`agent ${a.paneId} status=${a.status} prev=${this.prev.get(a.paneId)}`);
         // Keep the typing indicator in step with the agent, every pass.
         this.setTyping(a.paneId, a.status === 'working');
 
@@ -530,14 +534,25 @@ class Sync {
         // they move between tasks), so track both or thread names go stale.
         const want = threadName(a);
         const nameDrifted = this.names.get(a.paneId) !== want;
-        if (prev === a.status && !nameDrifted) continue; // nothing changed
+        // An agent with no thread needs one even when nothing about it has
+        // changed. Status and thread name are restored from the store while
+        // threads are looked up separately, so an agent recorded without a
+        // thread — or one whose thread was deleted by hand — otherwise reads
+        // as "nothing to do" on every pass and never appears in Discord again.
+        const noThread = !this.threads.has(a.paneId);
+        if (prev === a.status && !nameDrifted && !noThread) continue; // nothing changed
 
         try {
           const thread = await this.#ensureThread(channel, a);
 
-          // Keep the sidebar honest even when only the title moved.
-          if (nameDrifted) {
-            if (thread.name !== want) await thread.setName(want).catch(() => {});
+          // Keep the sidebar honest even when only the title moved — but never
+          // await the rename. Discord allows roughly two thread renames per ten
+          // minutes and discord.js waits that limit out rather than failing, so
+          // awaiting here parks the whole pass, for every project, behind one
+          // cosmetic change. #renameLater records the name once it lands.
+          if (nameDrifted && thread.name !== want) {
+            this.#renameLater(thread, want, a.paneId);
+          } else if (nameDrifted) {
             this.names.set(a.paneId, want);
           }
 
@@ -566,6 +581,13 @@ class Sync {
             this.outputAt.delete(a.paneId); // bypass the throttle
             await this.streamOutput(a).catch(() => {});
             await this.#postAnswer(a, thread);
+            // The agent is free again — whoever is waiting to talk to it can
+            // go now. Not awaited on purpose: a queued prompt starting fresh
+            // work must not hold up the rest of this pass. "Blocked" counts as
+            // settled for output purposes but not for this: that agent is
+            // sitting on a permission prompt, and a queued question would be
+            // read as the answer to it.
+            if (a.status !== 'blocked') this.onSettled?.(a.paneId, thread);
           }
           this.prev.set(a.paneId, a.status);
         } catch (e) {

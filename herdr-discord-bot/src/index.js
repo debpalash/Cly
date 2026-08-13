@@ -412,6 +412,99 @@ async function handleClose(interaction) {
   await interaction.editReply(`⚫ Closed ${what} — \`${a.paneId}\` **${a.agent}** was ${a.status}.`);
 }
 
+// See or drop what is waiting for the agent whose thread you are in.
+async function handleQueue(interaction) {
+  const paneId =
+    interaction.options.getString('target') || sync?.paneForThread(interaction.channelId);
+  if (!paneId) {
+    await interaction.reply({
+      content: '⚠️ Run this inside an agent thread, or pass `target:` with a pane id.',
+      ephemeral: true,
+    });
+    return;
+  }
+  await interaction.deferReply({ ephemeral: true });
+
+  if (interaction.options.getBoolean('clear')) {
+    const n = queue?.clear(paneId) || 0;
+    await interaction.editReply(
+      n ? `🗑️ Dropped ${n} queued prompt${n === 1 ? '' : 's'} for \`${paneId}\`.` : 'Nothing was queued.',
+    );
+    return;
+  }
+
+  const items = queue?.list(paneId) || [];
+  if (!items.length) {
+    await interaction.editReply(`Nothing queued for \`${paneId}\` — it takes prompts straight away.`);
+    return;
+  }
+  const lines = items.map((q, i) => `**${i + 1}.** ${q.text.slice(0, 150)}`);
+  await interaction.editReply(
+    `⏳ **${items.length}** waiting for \`${paneId}\`\n${lines.join('\n').slice(0, 1800)}`,
+  );
+}
+
+// --- worktrees --------------------------------------------------------------
+// A worktree is how two agents work the same repo without fighting over the
+// same files: separate checkout, separate branch, one workspace each.
+async function handleWorktree(interaction) {
+  const extra = require('./herdr-extra');
+  const sub = interaction.options.getSubcommand();
+  const root = interaction.options.getString('project') || (await projectRootFor(interaction));
+  if (!root) {
+    await interaction.reply({
+      content: '⚠️ No project for this channel. Pass `project:` with an absolute path.',
+      ephemeral: true,
+    });
+    return;
+  }
+  await interaction.deferReply({ ephemeral: sub !== 'list' });
+
+  if (sub === 'list') {
+    const trees = await extra.listWorktrees({ cwd: root });
+    const lines = trees.map((w) => {
+      const open = w.openWorkspaceId ? ` · open as \`${w.openWorkspaceId}\`` : '';
+      return `${w.isLinked ? '🌿' : '🌳'} \`${w.branch || '(detached)'}\` — \`${w.path}\`${open}`;
+    });
+    const embed = new EmbedBuilder()
+      .setTitle(`${trees[0]?.repoName || path.basename(root)} — ${trees.length} worktree${trees.length === 1 ? '' : 's'}`)
+      .setColor(0x2ecc71)
+      .setDescription(lines.join('\n').slice(0, 4000) || '_none_');
+    await interaction.editReply({ embeds: [embed] });
+    return;
+  }
+
+  if (sub === 'new') {
+    const branch = interaction.options.getString('branch', true);
+    const base = interaction.options.getString('base');
+    const kind = interaction.options.getString('agent');
+
+    const res = await extra.createWorktree({ cwd: root, branch, base, focus: false });
+    let started = '';
+    if (kind) {
+      const agent = await extra.newAgent({ agentType: kind, cwd: res.path, focus: false });
+      started = `\nStarted **${kind}** in it — pane \`${agent.paneId || agent.agent?.paneId}\`.`;
+    }
+    await interaction.editReply(
+      `🌿 Worktree \`${res.branch || branch}\` at \`${res.path}\`\n` +
+        `workspace \`${res.workspaceId}\`${base ? ` · based on \`${base}\`` : ''}${started}`,
+    );
+    return;
+  }
+
+  if (sub === 'remove') {
+    const workspaceId = interaction.options.getString('workspace', true);
+    const force = interaction.options.getBoolean('force') || false;
+    const res = await extra.removeWorktree(workspaceId, { force });
+    // Removing a worktree does not delete its branch, and shouldn't — the
+    // commits on it are the whole point. Say so rather than let it look lost.
+    await interaction.editReply(
+      `🗑️ Removed worktree \`${res.path || workspaceId}\`${res.forced ? ' (forced)' : ''} and closed its workspace.\n` +
+        `_The branch itself is untouched — delete it with git if you want it gone._`,
+    );
+  }
+}
+
 // --- project run / test -----------------------------------------------------
 // Resolve which project a command refers to: an explicit path, else the project
 // behind the channel it was typed in.
@@ -595,6 +688,8 @@ const HANDLERS = {
   screenshot: handleScreenshot,
   flow: handleFlow,
   close: handleClose,
+  queue: handleQueue,
+  worktree: handleWorktree,
   test: handleTest,
   run: handleRun,
   pr: handlePR,
@@ -626,6 +721,7 @@ const { Store } = require('./store');
 let sync = null;
 let store = null;
 let ciWatch = null;
+let queue = null;
 
 async function startSync(guild) {
   try {
@@ -635,14 +731,46 @@ async function startSync(guild) {
     console.error('[sync] store unavailable, continuing without persistence:', e.message);
     store = null;
   }
+  const { Queue } = require('./queue');
+  queue = new Queue({ store, log: { info: console.log, error: console.error } });
+
   sync = new Sync({
     client,
     guildId: guild.id,
     store,
     log: { info: console.log, error: console.error },
+    onSettled: (paneId, thread) => {
+      drainQueue(paneId, thread).catch((e) =>
+        console.error(`[queue] drain ${paneId} failed:`, e.message),
+      );
+    },
   });
   await sync.start(Number(process.env.SYNC_INTERVAL_MS || 5000));
   return sync;
+}
+
+// Hand a waiting prompt to an agent that has just gone quiet. One at a time:
+// the next one goes when this one settles, which is what makes it a queue
+// rather than a burst.
+async function drainQueue(paneId, thread) {
+  if (!queue?.size(paneId)) return;
+  const next = queue.shift(paneId);
+  if (!next) return;
+
+  try {
+    if (next.messageId) sync?.expectReply(paneId, next.messageId);
+    await herdr.promptAgent(paneId, next.text);
+    const left = queue.size(paneId);
+    await thread
+      ?.send(
+        `📨 Sent the queued prompt${left ? ` · ${left} still waiting` : ''}:\n> ${next.text.slice(0, 300)}`,
+      )
+      .catch(() => {});
+  } catch (e) {
+    // Put it back rather than silently losing what was typed.
+    queue.push(paneId, next);
+    throw e;
+  }
 }
 
 client.once(Events.ClientReady, async (c) => {
@@ -795,10 +923,32 @@ client.on(Events.MessageCreate, async (message) => {
     const text = (message.content || '').trim();
     if (!text || text.startsWith('//')) return;
 
+    // Talking over an agent that is mid-task derails it, so hold the prompt
+    // and hand it over the moment it settles. `!` sends anyway.
+    const urgent = text.startsWith('!');
+    const body = urgent ? text.slice(1).trim() : text;
+    if (!body) return;
+
+    if (!urgent && queue) {
+      const a = await herdr.getAgent(paneId).catch(() => null);
+      // Blocked counts too: that agent is sitting on a permission prompt, and
+      // free text typed at it answers the prompt rather than asking anything.
+      // The approve/deny buttons are how you get past that.
+      const busy = a && (a.status === 'working' || a.status === 'blocked');
+      if (busy || (a && queue.size(paneId) > 0)) {
+        const place = queue.push(paneId, { text: body, messageId: message.id });
+        await message.react('⏳').catch(() => {});
+        if (place > 1) {
+          await message.reply(`⏳ Queued — ${place} in line behind what it's doing.`).catch(() => {});
+        }
+        return;
+      }
+    }
+
     await message.react('📨').catch(() => {});
     // Pair the answer with the question: the agent's next output replies here.
     sync.expectReply(paneId, message.id);
-    await herdr.promptAgent(paneId, text);
+    await herdr.promptAgent(paneId, body);
     await message.react('✅').catch(() => {});
   } catch (e) {
     console.error('[thread-prompt] failed:', e.message);
