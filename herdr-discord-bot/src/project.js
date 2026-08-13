@@ -149,4 +149,38 @@ function runBounded(cmd, cwd, timeoutMs = 300000) {
   });
 }
 
-module.exports = { detect, runBounded };
+// A repo root often isn't where the app lives — this one keeps its bot in
+// herdr-discord-bot/. When the root yields no commands, look one level down and
+// adopt the single subdirectory that does. Only unambiguous cases are adopted:
+// if two subprojects both qualify, we would be guessing.
+function detectDeep(root) {
+  const top = detect(root);
+  if (top.run || top.test) return top;
+
+  let entries = [];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return top;
+  }
+
+  const candidates = [];
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    if (e.name.startsWith('.') || e.name === 'node_modules') continue;
+    const sub = detect(path.join(root, e.name));
+    if (sub.run || sub.test) candidates.push(sub);
+  }
+
+  if (candidates.length === 1) {
+    const only = candidates[0];
+    only.adoptedFrom = root;
+    return only;
+  }
+  if (candidates.length > 1) {
+    top.ambiguous = candidates.map((c) => c.name);
+  }
+  return top;
+}
+
+module.exports = { detect, detectDeep, runBounded };

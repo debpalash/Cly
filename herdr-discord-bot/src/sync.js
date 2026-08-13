@@ -346,6 +346,11 @@ class Sync {
           }
         }
         ch = await best.setName(name).catch(() => best);
+        // The adopted channel still describes the single workspace it used to
+        // serve; it now stands for the whole project.
+        await ch
+          .setTopic(`${projectKey} — one thread per agent. Type in a thread to prompt that agent.`)
+          .catch(() => {});
         this.log.info?.(`[sync] adopted ${legacy.length} legacy channel(s) as #${name}`);
       }
     }

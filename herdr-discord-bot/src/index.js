@@ -198,24 +198,18 @@ async function repoForInteraction(interaction) {
   if (explicit) return explicit;
 
   const gh = require('./github');
-  // Prefer the agent thread we're in, else any agent in this channel's workspace.
+  // Prefer the agent thread we're in, else the project behind this channel.
+  // sync.channels is keyed by project path (its git root), not by workspace id.
   const agents = await herdr.listAgents();
-  let cwd = null;
+  let dir = null;
 
   if (sync) {
     const paneId = sync.paneForThread(interaction.channelId);
-    if (paneId) cwd = agents.find((a) => a.paneId === paneId)?.cwd || null;
-    if (!cwd) {
-      for (const [wsId, chId] of sync.channels) {
-        if (chId === interaction.channelId) {
-          cwd = agents.find((a) => a.workspaceId === wsId)?.cwd || null;
-          break;
-        }
-      }
-    }
+    if (paneId) dir = agents.find((a) => a.paneId === paneId)?.cwd || null;
   }
-  if (!cwd) return null;
-  return gh.repoForDir(cwd);
+  if (!dir) dir = channelToProject(interaction.channelId);
+  if (!dir) return null;
+  return gh.repoForDir(dir);
 }
 
 async function handlePR(interaction) {
@@ -316,26 +310,44 @@ async function handleScreenshot(interaction) {
 // --- project run / test -----------------------------------------------------
 // Resolve which project a command refers to: an explicit path, else the project
 // behind the channel it was typed in.
-async function projectRootFor(interaction) {
-  const explicit = interaction.options.getString('project');
-  if (explicit) return explicit;
-
-  const agents = await herdr.listAgents();
-  if (sync) {
-    const paneId = sync.paneForThread(interaction.channelId);
-    if (paneId) {
-      const a = agents.find((x) => x.paneId === paneId);
-      if (a) return sync.projectKeyForCwd ? sync.projectKeyForCwd(a.cwd) : a.cwd;
-    }
+// Which project a command refers to: an explicit path, the agent whose thread
+// we're in, or the project this channel stands for. The channel mapping is read
+// from memory first and the store second, so a command still resolves before
+// the first sync pass has run.
+function channelToProject(channelId) {
+  if (sync?.channels) {
     for (const [projectKey, chId] of sync.channels) {
-      if (chId === interaction.channelId) return projectKey;
+      if (chId === channelId) return projectKey;
     }
+  }
+  try {
+    const all = store?.allWorkspaceChannels?.() || [];
+    for (const { workspaceId, channelId: chId } of all) {
+      if (chId === channelId && String(workspaceId).startsWith('/')) return workspaceId;
+    }
+  } catch {
+    /* store is optional */
   }
   return null;
 }
 
+async function projectRootFor(interaction) {
+  const explicit = interaction.options.getString('project');
+  if (explicit) return explicit;
+
+  if (sync) {
+    const paneId = sync.paneForThread(interaction.channelId);
+    if (paneId) {
+      const agents = await herdr.listAgents();
+      const a = agents.find((x) => x.paneId === paneId);
+      if (a) return a.cwd;
+    }
+  }
+  return channelToProject(interaction.channelId);
+}
+
 async function handleTest(interaction) {
-  const { detect, runBounded } = require('./project');
+  const { detectDeep: detect, runBounded } = require('./project');
   await interaction.deferReply();
 
   const root = await projectRootFor(interaction);
@@ -346,13 +358,19 @@ async function handleTest(interaction) {
   const info = detect(root);
   if (!info.test) {
     await interaction.editReply(
-      `⚠️ No test command found for **${info.name}** (looked at ${info.evidence.join(', ') || 'nothing'}).`,
+      info.ambiguous
+        ? `⚠️ **${info.name}** has several subprojects (${info.ambiguous.join(', ')}). ` +
+            `Pass \`project:\` with the one you mean.`
+        : `⚠️ No test command found for **${info.name}** (looked at ${info.evidence.join(', ') || 'nothing'}).`,
     );
     return;
   }
 
+  // Run where the manifest lives, not at the repo root — detection may have
+  // adopted a subproject (this repo keeps its app in herdr-discord-bot/).
+  const cwd = info.root || root;
   await interaction.editReply(`🧪 Running \`${info.test}\` in **${info.name}**…`);
-  const res = await runBounded(info.test, root);
+  const res = await runBounded(info.test, cwd);
   const tail = (res.stdout + '\n' + res.stderr).trim().split('\n').slice(-25).join('\n');
 
   const embed = new EmbedBuilder()
@@ -366,7 +384,7 @@ async function handleTest(interaction) {
 }
 
 async function handleRun(interaction) {
-  const { detect } = require('./project');
+  const { detectDeep: detect } = require('./project');
   const extra = require('./herdr-extra');
   await interaction.deferReply({ ephemeral: true });
 
@@ -383,8 +401,10 @@ async function handleRun(interaction) {
   }
 
   // A dev server is long-lived, so it belongs in a herdr pane where it keeps
-  // running and its output streams into Discord like any other agent.
-  const ws = await extra.createWorkspace({ cwd: root, label: `run ${info.name}`, focus: false });
+  // running and its output streams into Discord like any other agent. Start it
+  // where its manifest lives, which may be a subproject of the repo root.
+  const cwd = info.root || root;
+  const ws = await extra.createWorkspace({ cwd, label: `run ${info.name}`, focus: false });
   await extra.runInPane(ws.pane.paneId || ws.pane.id, cmd);
 
   await interaction.editReply(
