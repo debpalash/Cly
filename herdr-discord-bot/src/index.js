@@ -319,9 +319,92 @@ async function handleScreenshot(interaction) {
   }
 }
 
+// --- project run / test -----------------------------------------------------
+// Resolve which project a command refers to: an explicit path, else the project
+// behind the channel it was typed in.
+async function projectRootFor(interaction) {
+  const explicit = interaction.options.getString('project');
+  if (explicit) return explicit;
+
+  const agents = await herdr.listAgents();
+  if (sync) {
+    const paneId = sync.paneForThread(interaction.channelId);
+    if (paneId) {
+      const a = agents.find((x) => x.paneId === paneId);
+      if (a) return sync.projectKeyForCwd ? sync.projectKeyForCwd(a.cwd) : a.cwd;
+    }
+    for (const [projectKey, chId] of sync.channels) {
+      if (chId === interaction.channelId) return projectKey;
+    }
+  }
+  return null;
+}
+
+async function handleTest(interaction) {
+  const { detect, runBounded } = require('./project');
+  await interaction.deferReply();
+
+  const root = await projectRootFor(interaction);
+  if (!root) {
+    await interaction.editReply('⚠️ No project for this channel. Pass `project:` with an absolute path.');
+    return;
+  }
+  const info = detect(root);
+  if (!info.test) {
+    await interaction.editReply(
+      `⚠️ No test command found for **${info.name}** (looked at ${info.evidence.join(', ') || 'nothing'}).`,
+    );
+    return;
+  }
+
+  await interaction.editReply(`🧪 Running \`${info.test}\` in **${info.name}**…`);
+  const res = await runBounded(info.test, root);
+  const tail = (res.stdout + '\n' + res.stderr).trim().split('\n').slice(-25).join('\n');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`${res.ok ? '✅' : '❌'} ${info.name} — ${info.test}`)
+    .setColor(res.ok ? 0x57f287 : 0xed4245)
+    .setDescription(codeBlock(tail || '(no output)'))
+    .setFooter({
+      text: res.timedOut ? `timed out after ${res.ms}ms` : `exit ${res.code} · ${res.ms}ms`,
+    });
+  await interaction.editReply({ content: '', embeds: [embed] });
+}
+
+async function handleRun(interaction) {
+  const { detect } = require('./project');
+  const extra = require('./herdr-extra');
+  await interaction.deferReply({ ephemeral: true });
+
+  const root = await projectRootFor(interaction);
+  if (!root) {
+    await interaction.editReply('⚠️ No project for this channel. Pass `project:` with an absolute path.');
+    return;
+  }
+  const info = detect(root);
+  const cmd = interaction.options.getString('command') || info.run;
+  if (!cmd) {
+    await interaction.editReply(`⚠️ No run command found for **${info.name}**.`);
+    return;
+  }
+
+  // A dev server is long-lived, so it belongs in a herdr pane where it keeps
+  // running and its output streams into Discord like any other agent.
+  const ws = await extra.createWorkspace({ cwd: root, label: `run ${info.name}`, focus: false });
+  await extra.runInPane(ws.pane.paneId || ws.pane.id, cmd);
+
+  await interaction.editReply(
+    `▶️ Started \`${cmd}\` in **${info.name}**\n` +
+      `pane \`${ws.pane.paneId || ws.pane.id}\`` +
+      (info.port ? ` · try \`/screenshot ${info.port}\` once it boots` : ''),
+  );
+}
+
 const HANDLERS = {
   agents: handleAgents,
   screenshot: handleScreenshot,
+  test: handleTest,
+  run: handleRun,
   pr: handlePR,
   ci: handleCI,
   issues: handleIssues,
@@ -350,6 +433,7 @@ const { Store } = require('./store');
 
 let sync = null;
 let store = null;
+let ciWatch = null;
 
 async function startSync(guild) {
   try {
@@ -390,7 +474,15 @@ client.once(Events.ClientReady, async (c) => {
       const s = await startSync(guild);
       // The live panel lives in the control channel and refreshes every tick.
       s.attachDashboard(ch);
-      await s.tick().catch(() => {});
+      // Not awaited: a full pass over every project and thread can take a
+      // while, and nothing below should wait on it.
+      s.tick().catch(() => {});
+
+      if (process.env.CI_WATCH !== '0') {
+        const { CIWatch } = require('./ci-watch');
+        ciWatch = new CIWatch({ sync: s, store, log: { info: console.log, error: console.error } });
+        ciWatch.start().catch((e) => console.error('[ci] start failed:', e.message));
+      }
     }
   } catch (e) {
     console.error('[ready] setup error:', e.message);

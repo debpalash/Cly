@@ -44,6 +44,23 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('test')
+    .setDescription("Run this project's test suite")
+    .addStringOption((o) =>
+      o.setName('project').setDescription('Absolute path (inferred from the channel if omitted)'),
+    ),
+
+  new SlashCommandBuilder()
+    .setName('run')
+    .setDescription("Start this project's dev command in a herdr pane")
+    .addStringOption((o) =>
+      o.setName('project').setDescription('Absolute path (inferred from the channel if omitted)'),
+    )
+    .addStringOption((o) =>
+      o.setName('command').setDescription('Override the detected command'),
+    ),
+
+  new SlashCommandBuilder()
     .setName('screenshot')
     .setDescription('Screenshot a running app (URL, or just a port)')
     .addStringOption((o) =>
