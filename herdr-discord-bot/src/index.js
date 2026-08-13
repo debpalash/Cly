@@ -196,8 +196,135 @@ async function handleNew(interaction) {
   );
 }
 
+// --- GitHub ---------------------------------------------------------------
+// A workspace channel maps to a project directory (its agents' cwd), so GitHub
+// commands used inside one can infer the repo instead of making you type it.
+async function repoForInteraction(interaction) {
+  const explicit = interaction.options.getString('repo');
+  if (explicit) return explicit;
+
+  const gh = require('./github');
+  // Prefer the agent thread we're in, else any agent in this channel's workspace.
+  const agents = await herdr.listAgents();
+  let cwd = null;
+
+  if (sync) {
+    const paneId = sync.paneForThread(interaction.channelId);
+    if (paneId) cwd = agents.find((a) => a.paneId === paneId)?.cwd || null;
+    if (!cwd) {
+      for (const [wsId, chId] of sync.channels) {
+        if (chId === interaction.channelId) {
+          cwd = agents.find((a) => a.workspaceId === wsId)?.cwd || null;
+          break;
+        }
+      }
+    }
+  }
+  if (!cwd) return null;
+  return gh.repoForDir(cwd);
+}
+
+async function handlePR(interaction) {
+  const gh = require('./github');
+  await interaction.deferReply({ ephemeral: true });
+  const repo = await repoForInteraction(interaction);
+  if (!repo) {
+    await interaction.editReply(
+      '⚠️ No GitHub repo for this channel. Pass `repo:` (e.g. `debpalash/Opal`) or run it in a workspace channel.',
+    );
+    return;
+  }
+  const prs = await gh.listPRs(repo, { state: 'open', limit: 15 });
+  const embed = new EmbedBuilder()
+    .setTitle(`${repo} — ${prs.length} open PR${prs.length === 1 ? '' : 's'}`)
+    .setColor(prs.length ? 0x5865f2 : 0x57f287)
+    .setDescription(prs.map(gh.prLine).join('\n').slice(0, 4000) || '_none open_');
+  await interaction.editReply({ embeds: [embed] });
+}
+
+async function handleCI(interaction) {
+  const gh = require('./github');
+  await interaction.deferReply({ ephemeral: true });
+  const repo = await repoForInteraction(interaction);
+  if (!repo) {
+    await interaction.editReply('⚠️ No GitHub repo for this channel. Pass `repo:`.');
+    return;
+  }
+  const runs = await gh.listRuns(repo, { limit: 10 });
+  const bad = runs.some((r) => r.conclusion === 'failure');
+  const embed = new EmbedBuilder()
+    .setTitle(`${repo} — recent CI`)
+    .setColor(bad ? 0xed4245 : 0x57f287)
+    .setDescription(runs.map(gh.runLine).join('\n').slice(0, 4000) || '_no runs_');
+  await interaction.editReply({ embeds: [embed] });
+}
+
+async function handleIssues(interaction) {
+  const gh = require('./github');
+  await interaction.deferReply({ ephemeral: true });
+  const repo = await repoForInteraction(interaction);
+  if (!repo) {
+    await interaction.editReply('⚠️ No GitHub repo for this channel. Pass `repo:`.');
+    return;
+  }
+  const issues = await gh.listIssues(repo, { state: 'open', limit: 15 });
+  const lines = issues.map(
+    (i) => `🐛 [#${i.number}](${i.url}) ${i.title.slice(0, 70)} · _${i.author}_`,
+  );
+  const embed = new EmbedBuilder()
+    .setTitle(`${repo} — ${issues.length} open issue${issues.length === 1 ? '' : 's'}`)
+    .setColor(0xfaa61a)
+    .setDescription(lines.join('\n').slice(0, 4000) || '_none open_');
+  await interaction.editReply({ embeds: [embed] });
+}
+
+// --- browser testing --------------------------------------------------------
+// Screenshot a running app. Accepts a full URL, a bare port, or nothing (in
+// which case we offer whatever is actually listening).
+async function handleScreenshot(interaction) {
+  const browser = require('./browser');
+  const raw = (interaction.options.getString('target') || '').trim();
+  await interaction.deferReply();
+
+  let url = raw;
+  if (!raw) {
+    const ports = await browser.listeningPorts();
+    await interaction.editReply(
+      ports.length
+        ? `Which one? Re-run with a port or URL.\nListening now: ${ports
+            .map((p) => `\`${p}\``)
+            .join(' ')}`
+        : 'Nothing is listening on this machine right now.',
+    );
+    return;
+  }
+  if (/^\d+$/.test(raw)) url = `http://127.0.0.1:${raw}/`;
+  else if (!/^https?:\/\//i.test(raw)) url = `http://${raw}`;
+
+  try {
+    const shot = await browser.capture(url);
+    const problems = [
+      ...shot.consoleErrors.map((e) => `⚠️ ${e}`),
+      ...shot.failedRequests.map((e) => `🚫 ${e}`),
+    ].slice(0, 5);
+
+    await interaction.editReply({
+      content:
+        `📸 **${shot.title || url}** · ${url} · ${shot.ms}ms` +
+        (problems.length ? `\n${problems.join('\n').slice(0, 1500)}` : ''),
+      files: [{ attachment: shot.png, name: 'screenshot.png' }],
+    });
+  } catch (e) {
+    await interaction.editReply(`⚠️ Could not capture ${url}: ${e.message}`);
+  }
+}
+
 const HANDLERS = {
   agents: handleAgents,
+  screenshot: handleScreenshot,
+  pr: handlePR,
+  ci: handleCI,
+  issues: handleIssues,
   status: handleStatus,
   read: handleRead,
   prompt: handlePrompt,

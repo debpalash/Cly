@@ -44,6 +44,37 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('screenshot')
+    .setDescription('Screenshot a running app (URL, or just a port)')
+    .addStringOption((o) =>
+      o
+        .setName('target')
+        .setDescription('URL or port, e.g. 3900 or http://localhost:3901')
+        .setRequired(false),
+    ),
+
+  new SlashCommandBuilder()
+    .setName('pr')
+    .setDescription('Open pull requests for this project')
+    .addStringOption((o) =>
+      o.setName('repo').setDescription('owner/name (inferred from the channel if omitted)'),
+    ),
+
+  new SlashCommandBuilder()
+    .setName('ci')
+    .setDescription('Recent CI runs for this project')
+    .addStringOption((o) =>
+      o.setName('repo').setDescription('owner/name (inferred from the channel if omitted)'),
+    ),
+
+  new SlashCommandBuilder()
+    .setName('issues')
+    .setDescription('Open issues for this project')
+    .addStringOption((o) =>
+      o.setName('repo').setDescription('owner/name (inferred from the channel if omitted)'),
+    ),
+
+  new SlashCommandBuilder()
     .setName('agents')
     .setDescription('List all herdr agents and their status'),
 
