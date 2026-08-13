@@ -15,6 +15,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageType,
 } = require('discord.js');
 const herdr = require('./herdr');
 const { Dashboard } = require('./dashboard');
@@ -110,12 +111,17 @@ class Sync {
     this.names = new Map(); // paneId -> last thread name we set
     this.outputMsg = new Map(); // paneId -> id of its live output message
     this.outputText = new Map(); // paneId -> last body we rendered
+    this.outLines = new Map(); // paneId -> last snapshot lines (for diffing)
+    this.outBuf = new Map(); // paneId -> { id, text } message being appended to
     this.outputAt = new Map(); // paneId -> last edit time (throttle)
     this.outputPending = new Set(); // panes with a flush already scheduled
     this.outputThrottleMs = Number(process.env.OUTPUT_THROTTLE_MS || 2000);
     this.outputLines = Number(process.env.OUTPUT_LINES || 25);
     this.typing = new Set(); // paneIds currently shown as "typing"
     this.typingTimer = null;
+    this.panelMsg = new Map(); // channelId -> its live panel message id
+    this.panelSig = new Map(); // channelId -> last rendered signature
+    this.swept = new Set(); // channels already cleaned of system noise
     this.events = null; // herdr event stream, when available
     this.inFlight = null; // in-progress tick, so bursts coalesce
     this.pending = false; // a change arrived while a tick was running
@@ -197,6 +203,8 @@ class Sync {
       for (const [k, v] of Object.entries(nm)) this.names.set(k, v);
       const om = this.store.getMeta?.('outputMsgs') || {};
       for (const [k, v] of Object.entries(om)) this.outputMsg.set(k, v);
+      const pm = this.store.getMeta?.('panelMsgs') || {};
+      for (const [k, v] of Object.entries(pm)) this.panelMsg.set(k, v);
     } catch (e) {
       this.log.error('[sync] could not load state:', e.message);
     }
@@ -268,6 +276,11 @@ class Sync {
       const t = await channel.threads.fetch(existingId).catch(() => null);
       if (t) {
         if (t.archived) await t.setArchived(false).catch(() => {});
+        // Clear any rename notices that accumulated before this run.
+        if (!this.swept.has(t.id)) {
+          this.swept.add(t.id);
+          this.#sweepRenames(t).catch(() => {});
+        }
         return t;
       }
       this.threads.delete(agent.paneId);
@@ -354,6 +367,12 @@ class Sync {
         continue;
       }
 
+      // Clean the channel body once per run, then keep its panel current.
+      if (!this.swept.has(channel.id)) {
+        this.swept.add(channel.id);
+        await this.#sweepNoise(channel);
+      }
+
       for (const a of list) {
         // Keep the typing indicator in step with the agent, every pass.
         this.setTyping(a.paneId, a.status === 'working');
@@ -387,7 +406,12 @@ class Sync {
               components: a.status === 'blocked' ? [blockedActions(a.paneId)] : [],
             });
             // rename thread so the sidebar reflects live status
-            if (thread.name !== want) await thread.setName(want).catch(() => {});
+            if (thread.name !== want) {
+              await thread.setName(want).catch(() => {});
+              // Discord logs every rename in the thread itself; with a status in
+              // the name that is one noise line per transition. Drop them.
+              this.#sweepRenames(thread).catch(() => {});
+            }
             this.names.set(a.paneId, want);
           }
           // On settle, make sure the live output message reflects the final
@@ -402,6 +426,9 @@ class Sync {
           this.log.error(`[sync] agent ${a.paneId} update failed:`, e.message);
         }
       }
+
+      // The channel's own index, refreshed after its agents are settled.
+      await this.#renderPanel(channel, wsId, list).catch(() => {});
     }
 
     // agents that disappeared
@@ -431,6 +458,87 @@ class Sync {
     }
 
     this.#persist();
+  }
+
+  // Discord posts a "started a thread" system message for every thread created.
+  // With one thread per agent that is the entire channel body — pure noise that
+  // also survives the thread being deleted. Sweep it so the channel holds only
+  // the live panel.
+  async #sweepNoise(channel) {
+    try {
+      const msgs = await channel.messages.fetch({ limit: 50 });
+      const junk = msgs.filter(
+        (m) => m.type === MessageType.ThreadCreated && m.id !== this.panelMsg.get(channel.id),
+      );
+      for (const [, m] of junk) await m.delete().catch(() => {});
+      if (junk.size) this.log.info?.(`[sync] swept ${junk.size} thread-created notices`);
+    } catch (e) {
+      this.log.error('[sync] sweep failed:', e.message);
+    }
+  }
+
+  // Remove the "changed the channel name" notices Discord posts inside a thread
+  // each time we rename it to reflect status.
+  async #sweepRenames(thread) {
+    try {
+      const msgs = await thread.messages.fetch({ limit: 25 });
+      const junk = msgs.filter((m) => m.type === MessageType.ChannelNameChange);
+      for (const [, m] of junk) await m.delete().catch(() => {});
+    } catch {
+      /* best effort — never block a status update on cosmetics */
+    }
+  }
+
+  // One embed per workspace channel, edited in place: the channel's own live
+  // index of its agents, so the channel body reads as a panel not a log.
+  async #renderPanel(channel, wsId, agents) {
+    const rank = { blocked: 0, working: 1, done: 2, idle: 3, unknown: 4 };
+    const sorted = [...agents].sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+    const gid = this.guild.id;
+
+    const lines = sorted.map((a) => {
+      const e = STATUS_EMOJI[a.status] || '⚪';
+      const tid = this.threads.get(a.paneId);
+      const label = clampName(a.title, 46) || a.cwd.split('/').pop();
+      const link = tid
+        ? `[\`${a.paneId}\`](https://discord.com/channels/${gid}/${tid})`
+        : `\`${a.paneId}\``;
+      return `${e} ${link} · ${label}`;
+    });
+
+    const counts = sorted.reduce((m, a) => ((m[a.status] = (m[a.status] || 0) + 1), m), {});
+    const project = sorted[0]?.cwd.split('/').filter(Boolean).pop() || wsId;
+    const color = counts.blocked ? 0xed4245 : counts.working ? 0xfaa61a : 0x57f287;
+
+    const embed = new EmbedBuilder()
+      .setTitle(`${project} · workspace ${wsId}`)
+      .setDescription(lines.join('\n') || '_no agents_')
+      .setColor(color)
+      .setFooter({
+        text: `${sorted.length} agents · open a thread and type to prompt that agent`,
+      });
+
+    const sig = lines.join('|') + color;
+    if (this.panelSig.get(channel.id) === sig) return;
+    this.panelSig.set(channel.id, sig);
+
+    try {
+      const existing = this.panelMsg.get(channel.id);
+      if (existing) {
+        const msg = await channel.messages.fetch(existing).catch(() => null);
+        if (msg) {
+          await msg.edit({ embeds: [embed] });
+          return;
+        }
+        this.panelMsg.delete(channel.id);
+      }
+      const msg = await channel.send({ embeds: [embed] });
+      this.panelMsg.set(channel.id, msg.id);
+      this.store?.setMeta?.('panelMsgs', Object.fromEntries(this.panelMsg));
+      await msg.pin().catch(() => {});
+    } catch (e) {
+      this.log.error(`[sync] panel for ${wsId} failed:`, e.message);
+    }
   }
 
   // Discord's typing indicator lasts ~10s, so it has to be re-sent on a timer
@@ -466,12 +574,53 @@ class Sync {
     }
   }
 
-  // Stream an agent's terminal output into its thread in near-real time.
-  //
-  // Rather than posting a new message per burst (which would flood the thread
-  // and hit rate limits), each agent keeps ONE "live output" message that is
-  // edited in place. Edits are throttled per agent and skipped when the visible
-  // text has not actually changed.
+  // Agent TUIs repaint their whole screen: a spinner, elapsed time, token
+  // counters, the input box and the status bar all change every frame. Left in,
+  // no two reads ever match and every frame looks like new output. Strip that
+  // chrome so only real transcript lines are compared and posted.
+  static isChrome(line) {
+    const s = line.trim();
+    if (!s) return true;
+    if (/^[\s─-╿_=~-]+$/.test(s)) return true; // rules / box drawing
+    if (/^[❯>»]\s*$/.test(s)) return true; // empty input prompt
+    if (/esc to interrupt|shift\+tab|bypass permissions|auto mode on|for agents/i.test(s)) {
+      return true; // status bar
+    }
+    if (/^[✻✳✽◐◑◒◓⠇⠏⠋⠙⠹⠸⠼⠴⠦⠧*+]\s/.test(s) && /tokens?\)/i.test(s)) return true; // spinner
+    if (/\(\s*\d+[hms].*?(tokens|esc)\b/i.test(s)) return true; // "(1m 50s · ↓ 6.0k tokens)"
+    if (/^Tip: Use|^⎿\s+Tip: Use/i.test(s)) return true; // rotating tips
+    return false;
+  }
+
+  static stripChrome(lines) {
+    return lines.filter((l) => !Sync.isChrome(l));
+  }
+
+  // Terminal reads return a rolling window of recent lines, not a feed of new
+  // ones, so consecutive reads overlap heavily. Find the longest suffix of what
+  // we already emitted that prefixes the new snapshot; everything past it is
+  // genuinely new. Falls back to "all of it" when the windows don't overlap
+  // (the agent scrolled further than one window between reads).
+  static delta(prevLines, nextLines) {
+    if (!prevLines.length) return nextLines;
+    const max = Math.min(prevLines.length, nextLines.length);
+    for (let k = max; k > 0; k--) {
+      let match = true;
+      for (let i = 0; i < k; i++) {
+        if (prevLines[prevLines.length - k + i] !== nextLines[i]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) return nextLines.slice(k);
+    }
+    return nextLines;
+  }
+
+  // Stream an agent's terminal output into its thread as an append-only
+  // transcript: new lines are appended to the current message until it nears
+  // Discord's 2000-char limit, then a fresh message continues the log. This
+  // keeps full history instead of overwriting a single window.
   async streamOutput(agent) {
     const paneId = agent.paneId;
     if (!this.running) return;
@@ -503,25 +652,48 @@ class Sync {
     }
     if (!text || !text.trim()) return;
 
-    const body = codeBlock(text);
-    if (this.outputText.get(paneId) === body) return; // nothing visibly new
-    this.outputText.set(paneId, body);
+    // Compare only real transcript lines, never the repainting TUI chrome.
+    const nextLines = Sync.stripChrome(text.replace(/\s+$/, '').split('\n'));
+    if (!nextLines.length) return;
+    const prevLines = this.outLines.get(paneId) || [];
+    const fresh = Sync.delta(prevLines, nextLines);
+    if (!fresh.length) return;
+    this.outLines.set(paneId, nextLines);
+
+    const addition = fresh.join('\n');
 
     try {
       const thread = await this.guild.channels.fetch(threadId).catch(() => null);
       if (!thread) return;
       if (thread.archived) await thread.setArchived(false).catch(() => {});
 
-      const liveId = this.outputMsg.get(paneId);
-      if (liveId) {
-        const msg = await thread.messages.fetch(liveId).catch(() => null);
+      // Each post is numbered and labelled, so a long run reads as a thread of
+      // parts rather than an anonymous wall of code blocks.
+      const project = agent.cwd?.split('/').filter(Boolean).pop() || agent.workspaceId;
+      const header = (n) =>
+        `${STATUS_EMOJI[agent.status] || '⚪'} \`${paneId}\` · **${project}** · part ${n}\n`;
+
+      const buf = this.outBuf.get(paneId);
+      const budget = 1900;
+      const fits =
+        buf && header(buf.part).length + buf.text.length + addition.length + 10 < budget;
+
+      if (fits) {
+        const msg = await thread.messages.fetch(buf.id).catch(() => null);
         if (msg) {
-          await msg.edit({ content: body });
+          const merged = `${buf.text}\n${addition}`;
+          await msg.edit({ content: header(buf.part) + codeBlock(merged, budget - 120) });
+          this.outBuf.set(paneId, { ...buf, text: merged });
           return;
         }
-        this.outputMsg.delete(paneId); // deleted; fall through and repost
+        this.outBuf.delete(paneId); // message vanished; start a new one
       }
-      const msg = await thread.send({ content: body });
+
+      // Start a new part: either the first, or the previous one filled up.
+      const part = (buf?.part || 0) + 1;
+      const body = addition.length > 1700 ? addition.slice(-1700) : addition;
+      const msg = await thread.send({ content: header(part) + codeBlock(body, budget - 120) });
+      this.outBuf.set(paneId, { id: msg.id, text: body, part });
       this.outputMsg.set(paneId, msg.id);
       this.store?.setMeta?.('outputMsgs', Object.fromEntries(this.outputMsg));
     } catch (e) {
