@@ -76,21 +76,9 @@ function blockedActions(paneId) {
   );
 }
 
-const STATUS_EMOJI = {
-  idle: '🟢',
-  working: '🟡',
-  blocked: '🔴',
-  done: '✅',
-  unknown: '⚪',
-};
-
-const STATUS_COLOR = {
-  idle: 0x5865f2,
-  working: 0xfaa61a,
-  blocked: 0xed4245,
-  done: 0x57f287,
-  unknown: 0x99aab5,
-};
+// Presentation constants live in one place so the dashboard, the panels and the
+// threads can never drift apart on what "working" looks like.
+const { STATUS_EMOJI, STATUS_COLOR } = require('./format');
 
 // Statuses worth pushing an output tail for (the agent has settled).
 const SETTLED = new Set(['idle', 'done', 'blocked']);

@@ -4,13 +4,7 @@
 
 const { EmbedBuilder } = require('discord.js');
 
-const STATUS_EMOJI = {
-  idle: '🟢',
-  working: '🟡',
-  blocked: '🔴',
-  done: '✅',
-  unknown: '⚪',
-};
+const { STATUS_EMOJI } = require('./format');
 
 const RANK = { blocked: 0, working: 1, done: 2, idle: 3, unknown: 4 };
 

@@ -49,13 +49,7 @@ if (!OWNER_ID_VALID) {
 // guild owner at ready time (the person who created the server — see ClientReady).
 let effectiveOwnerId = OWNER_ID_VALID;
 
-const STATUS_EMOJI = {
-  idle: '🟢',
-  working: '🟡',
-  blocked: '🔴',
-  done: '✅',
-  unknown: '⚪',
-};
+const { STATUS_EMOJI } = require('./format');
 
 function authorized(interaction) {
   if (interaction.guildId !== GUILD_ID) return false;
@@ -400,8 +394,47 @@ async function handleRun(interaction) {
   );
 }
 
+// Move a task to a different agent/provider. See handoff.js on why this costs
+// tokens rather than being free.
+async function handleHandoff(interaction) {
+  const { buildBrief } = require('./handoff');
+  const extra = require('./herdr-extra');
+  await interaction.deferReply({ ephemeral: true });
+
+  const targetKind = interaction.options.getString('to', true);
+  const note = interaction.options.getString('note');
+  const fromArg = interaction.options.getString('from');
+
+  let paneId = fromArg;
+  if (!paneId && sync) paneId = sync.paneForThread(interaction.channelId);
+  if (!paneId) {
+    await interaction.editReply(
+      '⚠️ Run this inside an agent thread, or pass `from:` with a pane id.',
+    );
+    return;
+  }
+  const resolved = await herdr.resolveTarget(paneId);
+
+  const brief = await buildBrief(resolved.paneId, { note });
+  const created = await extra.newAgent({
+    agentType: targetKind,
+    cwd: brief.agent.cwd,
+    focus: false,
+  });
+  const newPane = created.paneId || created.agent?.paneId;
+  await herdr.promptAgent(newPane, brief.text);
+
+  await interaction.editReply(
+    `🔀 Handed off **${brief.agent.agent} → ${targetKind}**\n` +
+      `from \`${resolved.paneId}\` to \`${newPane}\` in \`${brief.agent.cwd}\`\n` +
+      `brief ≈ **${brief.approxTokens} tokens** (a transcript replay would be far larger)\n` +
+      `_The original agent is untouched — stop it yourself if you no longer need it._`,
+  );
+}
+
 const HANDLERS = {
   agents: handleAgents,
+  handoff: handleHandoff,
   screenshot: handleScreenshot,
   test: handleTest,
   run: handleRun,

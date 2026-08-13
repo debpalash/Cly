@@ -44,6 +44,28 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName('handoff')
+    .setDescription('Hand this task to a different agent/provider')
+    .addStringOption((o) =>
+      o
+        .setName('to')
+        .setDescription('Which agent takes over')
+        .setRequired(true)
+        .addChoices(
+          { name: 'claude', value: 'claude' },
+          { name: 'codex', value: 'codex' },
+          { name: 'opencode', value: 'opencode' },
+          { name: 'gemini', value: 'gemini' },
+        ),
+    )
+    .addStringOption((o) =>
+      o.setName('note').setDescription('Anything the new agent should know'),
+    )
+    .addStringOption((o) =>
+      o.setName('from').setDescription('Pane id (defaults to this thread)'),
+    ),
+
+  new SlashCommandBuilder()
     .setName('test')
     .setDescription("Run this project's test suite")
     .addStringOption((o) =>
