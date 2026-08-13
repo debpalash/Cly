@@ -162,12 +162,47 @@ async function handleSetup(interaction) {
   await interaction.editReply(`✅ Control channel ready: <#${ch.id}>. Try \`/agents\` there.`);
 }
 
+// Spawn a brand-new agent. herdr cannot create a pane and start an agent in one
+// step, so herdr-extra does it in two and rolls the layout back if the start
+// fails — a failed attempt never leaves an orphan pane behind.
+async function handleNew(interaction) {
+  const extra = require('./herdr-extra');
+  const kind = interaction.options.getString('agent', true);
+  const cwd = interaction.options.getString('cwd', true);
+  const prompt = interaction.options.getString('prompt');
+
+  if (extra.AGENT_KINDS && !extra.AGENT_KINDS.includes(kind)) {
+    await interaction.reply({
+      content: `⚠️ Unknown agent kind \`${kind}\`. Known: ${extra.AGENT_KINDS.join(', ')}`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+  // Starting an agent waits for it to become interactive, so this is slow.
+  const res = await extra.newAgent({ agentType: kind, cwd, focus: false });
+  const paneId = res.paneId || res.agent?.paneId;
+
+  if (prompt) {
+    await herdr.promptAgent(paneId, prompt).catch(() => {});
+  }
+
+  await interaction.editReply(
+    `🚀 Started **${kind}** in \`${cwd}\`\n` +
+      `pane \`${paneId}\` · workspace \`${res.workspaceId}\`` +
+      (prompt ? `\nSent your prompt.` : '') +
+      `\n_Its channel and thread appear here within a few seconds._`,
+  );
+}
+
 const HANDLERS = {
   agents: handleAgents,
   status: handleStatus,
   read: handleRead,
   prompt: handlePrompt,
   setup: handleSetup,
+  new: handleNew,
 };
 
 const client = new Client({

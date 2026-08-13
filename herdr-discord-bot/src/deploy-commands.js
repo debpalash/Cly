@@ -18,6 +18,32 @@ const commands = [
     .setDescription('Create/verify the agent-control channel in this server'),
 
   new SlashCommandBuilder()
+    .setName('new')
+    .setDescription('Start a new agent in a directory')
+    .addStringOption((o) =>
+      o
+        .setName('agent')
+        .setDescription('Which agent to run')
+        .setRequired(true)
+        .addChoices(
+          { name: 'claude', value: 'claude' },
+          { name: 'codex', value: 'codex' },
+          { name: 'opencode', value: 'opencode' },
+          { name: 'gemini', value: 'gemini' },
+          { name: 'cursor', value: 'cursor' },
+        ),
+    )
+    .addStringOption((o) =>
+      o
+        .setName('cwd')
+        .setDescription('Absolute path to work in, e.g. /home/ubuntu/github/Cly')
+        .setRequired(true),
+    )
+    .addStringOption((o) =>
+      o.setName('prompt').setDescription('Optional first prompt to send').setRequired(false),
+    ),
+
+  new SlashCommandBuilder()
     .setName('agents')
     .setDescription('List all herdr agents and their status'),
 
