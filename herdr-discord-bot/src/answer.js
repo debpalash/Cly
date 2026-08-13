@@ -539,16 +539,18 @@ function isHerdrError(lines) {
   }
 }
 
-function analyse(text, opts) {
-  const empty = { answer: '', confidence: 'low', kind: 'unknown', profile: 'none' };
+// Shared front half of every read: normalise the capture, pick the layout that
+// explains it best, and split it into blocks. Returns null when the text is not
+// a transcript at all.
+function prepare(text, opts) {
   let lines = toLines(text);
-  if (!lines.length || !lines.some((l) => l.trim())) return empty;
-  if (isHerdrError(lines)) return empty;
+  if (!lines.length || !lines.some((l) => l.trim())) return null;
+  if (isHerdrError(lines)) return null;
 
   const wrapWidth = wrapWidthOf(lines);
   const trimmed = trimFooter(lines);
   lines = trimmed.lines;
-  if (!lines.length) return empty;
+  if (!lines.length) return null;
 
   const explicit = resolveProfile(opts && opts.agent);
   const candidates = explicit
@@ -567,8 +569,18 @@ function analyse(text, opts) {
     const score = marked * 2 + prose;
     if (!best || score > best.score) best = { profile, blocks, score, prose };
   }
+  if (!best) return null;
+  return { ...best, lines, wrapWidth, explicit };
+}
 
-  if (!best || (!explicit && best.score === 0)) {
+function analyse(text, opts) {
+  const empty = { answer: '', confidence: 'low', kind: 'unknown', profile: 'none' };
+  const prep = prepare(text, opts);
+  if (!prep) return empty;
+  const { lines, wrapWidth, explicit } = prep;
+  const best = prep;
+
+  if (!explicit && best.score === 0) {
     const loose = looseFallback(lines, wrapWidth);
     return loose || empty;
   }
@@ -697,9 +709,79 @@ function lastAssistantBlock(text, opts) {
   }
 }
 
+const TOOL_LABEL_MAX = 90;
+
+// A tool card, reduced to the one line a human would read: "Ran npm test",
+// "Read(src/index.js)". The body is the tool's own output and belongs in the
+// raw transcript, not in a narration.
+function toolLabel(block) {
+  let head = String(block.head === undefined ? '' : block.head).trim();
+  if (!head) {
+    head = (block.body || []).map((s) => String(s).trim()).find(Boolean) || '';
+  }
+  head = head.replace(/\s+/g, ' ');
+  if (!head) return '';
+  return head.length > TOOL_LABEL_MAX ? `${head.slice(0, TOOL_LABEL_MAX - 1)}…` : head;
+}
+
+/**
+ * Everything the agent has said and done in this capture, in order — the
+ * running commentary behind a turn rather than only its conclusion.
+ *
+ * The last item is flagged: mid-turn it is very likely still being written, so
+ * a caller streaming these should hold it back until something follows it.
+ *
+ * @param {string} text  raw pane text (ANSI tolerated)
+ * @param {{agent?: string}} [opts]
+ * @returns {{items: {kind:'assistant'|'tool', text:string, last:boolean}[], profile:string}}
+ */
+function narrate(text, opts) {
+  try {
+    const prep = prepare(text, opts || {});
+    if (!prep || !prep.blocks) return { items: [], profile: 'none' };
+    const { profile, blocks, wrapWidth } = prep;
+
+    const items = [];
+    for (const b of blocks) {
+      if (b.kind === 'assistant') {
+        // The window starts mid-block when the top has scrolled away, and what
+        // is left carries no marker to say whose words they were. Often they
+        // are the human's own prompt, wrapped and indented exactly like a
+        // reply. Never open a narration with one.
+        if (!items.length && !b.marked) continue;
+        const rendered = renderBlock(b, profile, wrapWidth);
+        if (looksLikeProse(rendered)) items.push({ kind: 'assistant', text: rendered, last: false });
+        // Newer claude builds do not draw a card per call: they fold the work
+        // into a receipt line inside the message ("Read 1 file", "Made 3 edits
+        // +6"). renderBlock drops those as debris, which is right for an
+        // answer and wrong for a narration — it is the only evidence of what
+        // the agent did. They sit after the prose they follow, so emit them
+        // in that order.
+        for (const raw of b.body || []) {
+          const s = String(raw).trim();
+          if (s && isToolReceipt(s)) items.push({ kind: 'tool', text: s, last: false });
+        }
+      } else if (b.kind === 'tool') {
+        const label = toolLabel(b);
+        if (label) items.push({ kind: 'tool', text: label, last: false });
+      } else if (b.kind === 'user') {
+        // Not for posting — the prompt is already in the thread — but a caller
+        // catching up mid-run needs to know where the current turn began.
+        const asked = renderBlock(b, profile, wrapWidth);
+        if (asked) items.push({ kind: 'user', text: asked, last: false });
+      }
+    }
+    if (items.length) items[items.length - 1].last = true;
+    return { items, profile: profile.name };
+  } catch {
+    return { items: [], profile: 'none' };
+  }
+}
+
 module.exports = {
   extractAnswer,
   lastAssistantBlock,
+  narrate,
   stripChrome,
   isChrome,
   // exported for tests / callers that want to reuse the primitives

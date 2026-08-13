@@ -644,11 +644,25 @@ async function handleRun(interaction) {
   );
 }
 
+// Handoffs awaiting confirmation, keyed by the interaction that proposed them.
+// Short-lived on purpose: an offer you come back to an hour later is about a
+// thread you have long since navigated away from.
+const pendingHandoffs = new Map();
+const HANDOFF_TTL_MS = 5 * 60 * 1000;
+
+function rememberHandoff(token, plan) {
+  pendingHandoffs.set(token, { ...plan, at: Date.now() });
+  setTimeout(() => pendingHandoffs.delete(token), HANDOFF_TTL_MS).unref?.();
+}
+
 // Move a task to a different agent/provider. See handoff.js on why this costs
 // tokens rather than being free.
+//
+// Without `from:` the source is whichever thread you happen to be in, and a
+// handoff spawns a real agent in that agent's directory — so it can silently
+// start work in the wrong repository. Hence the confirmation: the directory is
+// on screen before anything is created.
 async function handleHandoff(interaction) {
-  const { buildBrief } = require('./handoff');
-  const extra = require('./herdr-extra');
   await interaction.deferReply({ ephemeral: true });
 
   const targetKind = interaction.options.getString('to', true);
@@ -665,7 +679,38 @@ async function handleHandoff(interaction) {
   }
   const resolved = await herdr.resolveTarget(paneId);
 
-  const brief = await buildBrief(resolved.paneId, { note });
+  const token = interaction.id;
+  rememberHandoff(token, { paneId: resolved.paneId, targetKind, note });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`handoffgo:${token}`)
+      .setLabel(`Hand off to ${targetKind}`)
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`handoffno:${token}`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary),
+  );
+
+  await interaction.editReply({
+    content:
+      `🔀 Hand off to **${targetKind}**?\n` +
+      `from \`${resolved.paneId}\` **${resolved.agent}** · ${resolved.status}\n` +
+      `“${resolved.title || 'no title'}”\n` +
+      `**A new ${targetKind} will start in** \`${resolved.cwd}\`` +
+      (fromArg ? '' : '\n_Source taken from this thread — check the path above._'),
+    components: [row],
+  });
+}
+
+// The confirmed half of /handoff: summarise the source agent's state and start
+// the new one on it.
+async function runHandoff({ paneId, targetKind, note }) {
+  const { buildBrief } = require('./handoff');
+  const extra = require('./herdr-extra');
+
+  const brief = await buildBrief(paneId, { note });
   const created = await extra.newAgent({
     agentType: targetKind,
     cwd: brief.agent.cwd,
@@ -674,11 +719,11 @@ async function handleHandoff(interaction) {
   const newPane = created.paneId || created.agent?.paneId;
   await herdr.promptAgent(newPane, brief.text);
 
-  await interaction.editReply(
+  return (
     `🔀 Handed off **${brief.agent.agent} → ${targetKind}**\n` +
-      `from \`${resolved.paneId}\` to \`${newPane}\` in \`${brief.agent.cwd}\`\n` +
-      `brief ≈ **${brief.approxTokens} tokens** (a transcript replay would be far larger)\n` +
-      `_The original agent is untouched — stop it yourself if you no longer need it._`,
+    `from \`${paneId}\` to \`${newPane}\` in \`${brief.agent.cwd}\`\n` +
+    `brief ≈ **${brief.approxTokens} tokens** (a transcript replay would be far larger)\n` +
+    `_The original agent is untouched — stop it yourself if you no longer need it._`
   );
 }
 
@@ -994,6 +1039,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `${e} \`${a.paneId}\` **${a.agent}** · ${a.status}\n` +
           `${a.title || '(no title)'}\n\`${a.cwd}\``,
       );
+      return;
+    }
+    if (action === 'handoffno') {
+      pendingHandoffs.delete(paneId);
+      await interaction.update({ content: '✋ Handoff cancelled — nothing was started.', components: [] });
+      return;
+    }
+    if (action === 'handoffgo') {
+      // `paneId` is the confirmation token here, not a pane.
+      const plan = pendingHandoffs.get(paneId);
+      pendingHandoffs.delete(paneId);
+      if (!plan) {
+        await interaction.update({
+          content: '⌛ That handoff offer has expired — run `/handoff` again.',
+          components: [],
+        });
+        return;
+      }
+      // Clear the buttons first: starting an agent takes seconds, and a second
+      // click in that window would hand off twice.
+      await interaction.update({ content: `🔀 Handing off to **${plan.targetKind}**…`, components: [] });
+      const done = await runHandoff(plan);
+      await interaction.editReply({ content: done, components: [] });
       return;
     }
     if (action === 'closeok') {

@@ -20,7 +20,7 @@ const {
 const { execFile } = require('node:child_process');
 const herdr = require('./herdr');
 const { Dashboard } = require('./dashboard');
-const { extractAnswer } = require('./answer');
+const { extractAnswer, narrate } = require('./answer');
 
 // Always-available controls, pinned in each agent's thread. Blocked agents get
 // the answer buttons below; these work at any time, so a running agent can be
@@ -159,6 +159,14 @@ class Sync {
     this.replyTo = new Map(); // paneId -> message id to reply to (a question)
     this.answers = new Map(); // paneId -> most recently posted final answer
     this.answerLines = Math.min(Math.max(Number(process.env.ANSWER_LINES || 120), 1), 200);
+    this.narrated = new Map(); // paneId -> Set of narration keys already seen
+    this.narratedProse = new Map(); // paneId -> Set of prose actually posted
+    this.activityMsg = new Map(); // paneId -> { id, labels } rolling tool line
+    // Mid-run, post what the agent is saying and doing rather than raw frames.
+    // RAW_FRAMES: 'fallback' (only when nothing readable came out), 'always'
+    // (both), 'never' (prose only).
+    this.narrateMode = (process.env.NARRATE || 'on').toLowerCase();
+    this.rawFrames = (process.env.RAW_FRAMES || 'fallback').toLowerCase();
     this.panelMsg = new Map(); // channelId -> its live panel message id
     this.panelSig = new Map(); // channelId -> last rendered signature
     this.swept = new Set(); // channels already cleaned of system noise
@@ -620,6 +628,9 @@ class Sync {
       this.outputAt.delete(paneId);
       this.typing.delete(paneId);
       this.answers.delete(paneId);
+      this.narrated.delete(paneId);
+      this.narratedProse.delete(paneId);
+      this.activityMsg.delete(paneId);
       this.store?.deleteThreadForAgent?.(paneId);
     }
 
@@ -879,7 +890,10 @@ class Sync {
 
     let text;
     try {
-      text = await herdr.readAgent(paneId, this.outputLines);
+      // Narration needs a few more lines of context than the raw diff does —
+      // a paragraph the agent wrote can be taller than the diff window.
+      const lines = this.narrateMode === 'on' ? Math.max(this.outputLines, 60) : this.outputLines;
+      text = await herdr.readAgent(paneId, lines);
     } catch {
       return;
     }
@@ -899,6 +913,20 @@ class Sync {
       const thread = await this.guild.channels.fetch(threadId).catch(() => null);
       if (!thread) return;
       if (thread.archived) await thread.setArchived(false).catch(() => {});
+
+      // Prose first. A terminal frame is a picture of a screen — spinners,
+      // redrawn boxes, half-rewritten lines — and on a phone a long run is
+      // nothing but that. When the capture parses, post what the agent
+      // actually said and did, and let the frames go.
+      let narrated = false;
+      if (this.narrateMode === 'on') {
+        narrated = await this.#narrateProgress(agent, text, thread).catch((e) => {
+          this.log.error(`[sync] narration for ${paneId} failed:`, e.message);
+          return false;
+        });
+      }
+      if (this.rawFrames === 'never') return;
+      if (narrated && this.rawFrames !== 'always') return;
 
       // Each post is numbered and labelled, so a long run reads as a thread of
       // parts rather than an anonymous wall of code blocks.
@@ -939,6 +967,143 @@ class Sync {
     }
   }
 
+  // Has this narration item been posted already, in this form or a fuller one?
+  //
+  // Exact keys are not enough. The capture is a window that scrolls, so a
+  // message whose opening lines have moved off the top re-renders as a shorter
+  // block with a different key — the tail of something already said, which
+  // would otherwise be posted a second time as the agent works on.
+  static alreadySaid(seen, item) {
+    if (seen.has(`${item.kind}:${item.text}`)) return true;
+    if (item.kind !== 'assistant') return false;
+    for (const key of seen) {
+      if (!key.startsWith('assistant:')) continue;
+      // Only a strictly larger block can contain this one; the equal case is
+      // the exact-key check above.
+      if (key.length > item.text.length + 10 && key.includes(item.text)) return true;
+    }
+    return false;
+  }
+
+  // Which narration items are worth posting now. Mutates `seen` so a later
+  // window does not repeat them.
+  //
+  // `holdLast` withholds the newest item, which is either still being written
+  // or is the answer to a question asked here — and an answer is posted as a
+  // reply to that question, not as narration.
+  static freshNarration(items, seen, holdLast) {
+    const fresh = [];
+    for (const it of items) {
+      if (it.last && holdLast) continue;
+      if (Sync.alreadySaid(seen, it)) continue;
+      seen.add(`${it.kind}:${it.text}`);
+      if (it.kind !== 'user') fresh.push(it); // the prompt is already in the thread
+    }
+    return fresh;
+  }
+
+  // Post what is new in the agent's running commentary: whole thoughts as
+  // messages, tool calls as one rolling line underneath them.
+  //
+  // Returns true when this agent's layout was understood — not when something
+  // was posted. That is what streamOutput needs: once a transcript is being
+  // narrated, a window that produced no new prose produced no news at all, and
+  // the raw frame for it would be pure repaint.
+  async #narrateProgress(agent, terminal, thread) {
+    const paneId = agent.paneId;
+    const { items } = narrate(terminal, { agent: agent.agent });
+    if (!items.length) return false;
+
+    // First sight of this pane: the capture window is a rolling view of the
+    // past, so everything in it has either already been posted or happened
+    // before this process started. Record it and say nothing — otherwise every
+    // restart replays the last turn into the thread.
+    //
+    // Except the turn now in progress. If the bot restarted while an agent was
+    // working, the part of the window after the last thing the human asked has
+    // not been reported anywhere, so leave it to be narrated normally.
+    let seen = this.narrated.get(paneId);
+    if (!seen) {
+      let old = items;
+      if (agent.status === 'working') {
+        let lastAsk = -1;
+        for (let i = 0; i < items.length; i += 1) if (items[i].kind === 'user') lastAsk = i;
+        if (lastAsk >= 0) old = items.slice(0, lastAsk + 1);
+      }
+      this.narrated.set(paneId, new Set(old.map((it) => `${it.kind}:${it.text}`)));
+      return true;
+    }
+
+    // Hold the newest item back while the agent is still writing it — something
+    // following it is what proves it is finished — and also when somebody here
+    // is waiting on an answer, because that last block is the answer and it has
+    // to be posted as a reply to their message rather than as narration.
+    const holdLast = agent.status === 'working' || this.replyTo.has(paneId);
+    const fresh = Sync.freshNarration(items, seen, holdLast);
+    // A long-running agent would otherwise accumulate every line it ever wrote.
+    // The window only ever holds recent lines, so old keys cannot recur.
+    if (seen.size > 200) {
+      this.narrated.set(paneId, new Set(Array.from(seen).slice(-100)));
+    }
+    // Nothing new to say — but the layout was understood, so whatever changed
+    // in the window was chrome: a spinner, a redrawn box, tool output being
+    // scrolled. That is exactly the noise the raw frame would have posted.
+    if (!fresh.length) return true;
+
+    let tools = [];
+    for (const it of fresh) {
+      if (it.kind === 'tool') {
+        tools.push(it.text);
+        continue;
+      }
+      await this.#appendActivity(paneId, thread, tools);
+      tools = [];
+      await this.#postProse(paneId, thread, it.text);
+    }
+    await this.#appendActivity(paneId, thread, tools);
+    return true;
+  }
+
+  // Tool calls are context, not conversation: they belong on one quiet line
+  // that keeps updating rather than a message each.
+  async #appendActivity(paneId, thread, labels) {
+    if (!labels.length) return;
+    const cur = this.activityMsg.get(paneId);
+    const all = (cur?.labels || []).concat(labels).slice(-12);
+    const body = `-# 🔧 ${all.join(' · ')}`.slice(0, 1900);
+
+    if (cur) {
+      const msg = await thread.messages.fetch(cur.id).catch(() => null);
+      if (msg) {
+        await msg.edit({ content: body });
+        this.activityMsg.set(paneId, { id: cur.id, labels: all });
+        return;
+      }
+    }
+    const msg = await thread.send({ content: body, allowedMentions: { parse: [] } });
+    this.activityMsg.set(paneId, { id: msg.id, labels: all });
+  }
+
+  async #postProse(paneId, thread, text) {
+    let posted = this.narratedProse.get(paneId);
+    if (!posted) {
+      posted = new Set();
+      this.narratedProse.set(paneId, posted);
+    }
+    posted.add(text);
+    if (posted.size > 40) this.narratedProse.set(paneId, new Set(Array.from(posted).slice(-20)));
+
+    // Close the current activity line so the thread stays chronological: the
+    // next tool call starts a fresh one below this message rather than
+    // back-filling one above it.
+    this.activityMsg.delete(paneId);
+    await thread.send({
+      content: `💬 ${answerText(text, 1800)}`,
+      // Terminal text is not a licence to ping the server.
+      allowedMentions: { parse: [] },
+    });
+  }
+
   // A terminal transcript is useful for diagnosis, but it is not a chat
   // reply: tool cards, spinners and diffs overwhelm the one thing a human
   // asked for. On a settled turn, extract and post only the agent's final
@@ -955,6 +1120,14 @@ class Sync {
     const body = answerText(result.answer);
     if (!body || result.kind !== 'prose') return;
     if (this.answers.get(agent.paneId) === body) return;
+    // Narration may already have posted this exact text as the turn ended.
+    // Repeat it anyway when it answers a question somebody asked here — the
+    // reply has to hang off their message — but not otherwise.
+    // Only text we actually posted counts. The seen-set also holds what was
+    // recorded silently at startup, and skipping on that would lose the answer
+    // to a turn that was already running when the bot restarted.
+    const narratedAlready = this.narratedProse.get(agent.paneId)?.has(result.answer);
+    if (narratedAlready && !this.replyTo.get(agent.paneId)) return;
 
     const payload = {
       content: `🤖 **${clampName(agent.title) || agent.paneId}**\n${body}`,
