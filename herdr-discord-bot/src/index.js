@@ -16,6 +16,7 @@ const {
   Events,
   EmbedBuilder,
   ChannelType,
+  Partials,
 } = require('discord.js');
 
 const herdr = require('./herdr');
@@ -174,7 +175,11 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
+  // DM channels arrive uncached, so they must be requested as partials or the
+  // message event never fires for them.
+  partials: [Partials.Channel, Partials.Message],
 });
 
 // --- live sync: herdr workspaces/agents mirrored to channels/threads --------
@@ -244,11 +249,91 @@ client.on(Events.GuildCreate, async (guild) => {
   }
 });
 
+// A DM is a private console: no server, no threads, just talk to herdr.
+// Supported: bare text -> overview; `<pane> <text>` -> prompt; `read <pane>`;
+// `agents`; `help`.
+async function handleDirectMessage(message) {
+  const text = (message.content || '').trim();
+  if (!text) return;
+
+  const reply = (s) => message.reply(s.length > 1950 ? s.slice(0, 1950) + '…' : s);
+
+  const [first, ...rest] = text.split(/\s+/);
+  const cmd = first.toLowerCase();
+
+  if (cmd === 'help') {
+    await reply(
+      '**herdr console**\n' +
+        '`agents` — list every agent\n' +
+        '`read <pane>` — recent output\n' +
+        '`<pane> <text>` — send a prompt to that agent\n' +
+        '`stop <pane>` — interrupt it\n' +
+        'Anything else shows the overview.',
+    );
+    return;
+  }
+
+  if (cmd === 'agents' || cmd === 'ls') {
+    const agents = await herdr.listAgents();
+    const rank = { blocked: 0, working: 1, done: 2, idle: 3, unknown: 4 };
+    agents.sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+    const lines = agents.map(
+      (a) =>
+        `${STATUS_EMOJI[a.status] || '⚪'} \`${a.paneId}\` ${a.title || a.cwd.split('/').pop()}`,
+    );
+    await reply(`**${agents.length} agents**\n${lines.join('\n')}`);
+    return;
+  }
+
+  if (cmd === 'read' && rest.length) {
+    const a = await herdr.resolveTarget(rest.join(' '));
+    const out = await herdr.readAgent(a.paneId, 30);
+    await reply(`**${a.title || a.paneId}** (${a.status})\n${codeBlock(out.trim() || '(no output)')}`);
+    return;
+  }
+
+  if (cmd === 'stop' && rest.length) {
+    const a = await herdr.resolveTarget(rest.join(' '));
+    await herdr.sendKeys(a.paneId, ['esc', 'esc']);
+    await reply(`⛔ Interrupted \`${a.paneId}\`.`);
+    return;
+  }
+
+  // "<pane> <prompt text>" — prompt a specific agent.
+  if (rest.length) {
+    try {
+      const a = await herdr.resolveTarget(first);
+      await herdr.promptAgent(a.paneId, rest.join(' '));
+      await reply(`📨 Sent to **${a.title || a.paneId}** \`${a.paneId}\`.`);
+      return;
+    } catch {
+      /* not a pane reference — fall through to the overview */
+    }
+  }
+
+  const agents = await herdr.listAgents();
+  const c = agents.reduce((m, a) => ((m[a.status] = (m[a.status] || 0) + 1), m), {});
+  await reply(
+    `🔴 ${c.blocked || 0} blocked · 🟡 ${c.working || 0} working · ` +
+      `✅ ${c.done || 0} done · 🟢 ${c.idle || 0} idle\n_Send \`help\` for commands._`,
+  );
+}
+
 // Typing inside an agent's thread sends that text to the agent as a prompt.
 // `//` prefix = human note, ignored. Only the authorized owner is obeyed.
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
+
+    // Direct message = private console. Owner only, same as everything else.
+    if (!message.guildId) {
+      if (message.author.id !== effectiveOwnerId) return;
+      await handleDirectMessage(message).catch(async (e) => {
+        await message.reply(`⚠️ ${e.message}`).catch(() => {});
+      });
+      return;
+    }
+
     if (!sync) return;
     if (message.guildId !== GUILD_ID) return;
     if (!message.channel?.isThread?.()) return;
