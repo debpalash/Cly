@@ -65,6 +65,14 @@ async function readAgent(target, lines = 40) {
   return out;
 }
 
+// Send raw key presses (e.g. 'esc', 'enter', 'y') to an agent. Used to answer
+// approval prompts and to interrupt a running turn.
+async function sendKeys(target, keys) {
+  const list = Array.isArray(keys) ? keys : [keys];
+  await runHerdr(['agent', 'send-keys', target, ...list.map(String)]);
+  return true;
+}
+
 async function promptAgent(target, text) {
   // No --wait here: keep the Discord interaction fast; caller can poll status.
   await runHerdr(['agent', 'prompt', target, text]);
@@ -123,5 +131,6 @@ module.exports = {
   getAgent,
   readAgent,
   promptAgent,
+  sendKeys,
   resolveTarget,
 };

@@ -199,6 +199,7 @@ async function startSync(guild) {
     log: { info: console.log, error: console.error },
   });
   await sync.start(Number(process.env.SYNC_INTERVAL_MS || 5000));
+  return sync;
 }
 
 client.once(Events.ClientReady, async (c) => {
@@ -219,7 +220,10 @@ client.once(Events.ClientReady, async (c) => {
       );
     }
     if (process.env.SYNC_DISABLED !== '1') {
-      await startSync(guild);
+      const s = await startSync(guild);
+      // The live panel lives in the control channel and refreshes every tick.
+      s.attachDashboard(ch);
+      await s.tick().catch(() => {});
     }
   } catch (e) {
     console.error('[ready] setup error:', e.message);
@@ -266,6 +270,47 @@ client.on(Events.MessageCreate, async (message) => {
   } catch (e) {
     console.error('[thread-prompt] failed:', e.message);
     await message.reply(`⚠️ ${e.message}`).catch(() => {});
+  }
+});
+
+// Buttons on blocked-agent notices: answer or interrupt without leaving Discord.
+const BUTTON_KEYS = {
+  approve: ['enter'],
+  deny: ['esc'],
+  interrupt: ['esc', 'esc'],
+};
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isButton()) return;
+  const [action, paneId] = (interaction.customId || '').split(':');
+  if (!action || !paneId) return;
+
+  if (interaction.guildId !== GUILD_ID || interaction.user.id !== effectiveOwnerId) {
+    await interaction.reply({ content: '⛔ Not authorized.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
+  try {
+    if (action === 'read') {
+      await interaction.deferReply({ ephemeral: true });
+      const out = await herdr.readAgent(paneId, 40);
+      await interaction.editReply(codeBlock(out.trim() || '(no output)'));
+      return;
+    }
+    const keys = BUTTON_KEYS[action];
+    if (!keys) return;
+    await interaction.deferReply({ ephemeral: true });
+    await herdr.sendKeys(paneId, keys);
+    const verb = { approve: '✅ Approved', deny: '🚫 Denied', interrupt: '⛔ Interrupted' }[action];
+    await interaction.editReply(`${verb} — sent \`${keys.join(' ')}\` to \`${paneId}\`.`);
+  } catch (e) {
+    console.error(`[button] ${action} failed:`, e.message);
+    const msg = { content: `⚠️ ${e.message}`, ephemeral: true };
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(msg).catch(() => {});
+    } else {
+      await interaction.reply(msg).catch(() => {});
+    }
   }
 });
 
