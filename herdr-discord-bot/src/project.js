@@ -149,6 +149,42 @@ function runBounded(cmd, cwd, timeoutMs = 300000) {
   });
 }
 
+// Having launched a command we watch its pane rather than assume it worked. A
+// dev server announces a URL; a failure prints an error and hands the shell
+// straight back. `read` returns the pane's visible text, and is injected so
+// this stays testable without a terminal.
+const SERVE_URL = /https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::(\d+))?[^\s`'"]*/i;
+const DIED = /(?:exited with code|command not found|No such file or directory|^\s*error[: ])/im;
+
+async function observeStart(read, { waitMs = 9000, stepMs = 900 } = {}) {
+  const deadline = Date.now() + waitMs;
+  let last = '';
+  let polls = 0;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, stepMs));
+    last = (await read().catch(() => '')) || '';
+    polls += 1;
+
+    // Whether the process is still alive decides everything, so test that
+    // first: a failing launcher often prints a URL inside its own error
+    // message, and reading that as success would be exactly backwards.
+    const lines = last.split('\n').filter((l) => l.trim());
+    const back = /[$#%]\s*$/.test(lines[lines.length - 1] || '');
+    if (back) {
+      // The first read can catch the shell before it has even echoed the
+      // command, which looks identical to "already finished" — so wait one
+      // more round before calling it. Either way, a pane sitting at a prompt
+      // has nothing serving, so don't look for a URL in it.
+      if (polls > 1) return { state: DIED.test(last) ? 'failed' : 'exited', output: last };
+      continue;
+    }
+
+    const url = last.match(SERVE_URL);
+    if (url) return { state: 'serving', url: url[0], port: url[1] ? Number(url[1]) : null };
+  }
+  return { state: 'running', output: last };
+}
+
 // A repo root often isn't where the app lives — this one keeps its bot in
 // herdr-discord-bot/. When the root yields no commands, look one level down and
 // adopt the single subdirectory that does. Only unambiguous cases are adopted:
@@ -183,4 +219,4 @@ function detectDeep(root) {
   return top;
 }
 
-module.exports = { detect, detectDeep, runBounded };
+module.exports = { detect, detectDeep, runBounded, observeStart };

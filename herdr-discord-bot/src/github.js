@@ -167,9 +167,21 @@ function runEmoji(run) {
   return RUN_EMOJI[run.conclusion] || '⚪';
 }
 
+// Bug reports quote URLs, and truncating one mid-string leaves Discord
+// auto-linking a fragment that goes nowhere. Reduce any URL in a title to its
+// host so the line stays readable and every link on screen is real.
+function titleLine(title, max = 70) {
+  const flat = String(title || '').replace(/https?:\/\/([^\s/]+)\S*/g, (_, host) => `\`${host}\``);
+  if (flat.length <= max) return flat;
+  let cut = flat.slice(0, max).trimEnd();
+  // Don't leave a code span hanging open — Discord would swallow the rest.
+  if ((cut.match(/`/g) || []).length % 2) cut += '`';
+  return cut + '…';
+}
+
 function prLine(p) {
   const mark = p.draft ? '📝' : p.review === 'APPROVED' ? '✅' : '🔵';
-  return `${mark} [#${p.number}](${p.url}) ${p.title.slice(0, 70)} · _${p.author}_`;
+  return `${mark} [#${p.number}](${p.url}) ${titleLine(p.title)} · _${p.author}_`;
 }
 
 function runLine(r) {
@@ -196,6 +208,7 @@ module.exports = {
   listRuns,
   repoSummary,
   prLine,
+  titleLine,
   runLine,
   runEmoji,
   isAvailable,

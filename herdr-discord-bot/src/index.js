@@ -257,7 +257,7 @@ async function handleIssues(interaction) {
   }
   const issues = await gh.listIssues(repo, { state: 'open', limit: 15 });
   const lines = issues.map(
-    (i) => `🐛 [#${i.number}](${i.url}) ${i.title.slice(0, 70)} · _${i.author}_`,
+    (i) => `🐛 [#${i.number}](${i.url}) ${gh.titleLine(i.title)} · _${i.author}_`,
   );
   const embed = new EmbedBuilder()
     .setTitle(`${repo} — ${issues.length} open issue${issues.length === 1 ? '' : 's'}`)
@@ -384,7 +384,7 @@ async function handleTest(interaction) {
 }
 
 async function handleRun(interaction) {
-  const { detectDeep: detect } = require('./project');
+  const { detectDeep: detect, observeStart } = require('./project');
   const extra = require('./herdr-extra');
   await interaction.deferReply({ ephemeral: true });
 
@@ -405,12 +405,32 @@ async function handleRun(interaction) {
   // where its manifest lives, which may be a subproject of the repo root.
   const cwd = info.root || root;
   const ws = await extra.createWorkspace({ cwd, label: `run ${info.name}`, focus: false });
-  await extra.runInPane(ws.pane.paneId || ws.pane.id, cmd);
+  const paneId = ws.pane.paneId || ws.pane.id;
+  await extra.runInPane(paneId, cmd);
+  await interaction.editReply(`▶️ Starting \`${cmd}\` in **${info.name}**…`);
 
+  // `visible` is the screen itself. The `recent` sources track output since the
+  // last marker and come back empty for a plain shell pane, which is this case.
+  const seen = await observeStart(() => extra.readPane(paneId, { lines: 40, source: 'visible' }));
+
+  if (seen.state === 'failed' || seen.state === 'exited') {
+    // The pane is now an idle shell — nothing to keep, and leaving it behind
+    // would litter the sidebar with dead workspaces.
+    await extra.closeWorkspace(ws.workspace.workspaceId || ws.workspace.id).catch(() => {});
+    const tail = seen.output.trim().split('\n').slice(-12).join('\n');
+    const verb = seen.state === 'failed' ? '❌ failed' : '✅ finished';
+    await interaction.editReply(
+      `${verb} — \`${cmd}\` did not stay running in **${info.name}**\n${codeBlock(tail)}`,
+    );
+    return;
+  }
+
+  // Prefer the port the process actually announced over the one we guessed.
+  const port = seen.port || info.port;
   await interaction.editReply(
-    `▶️ Started \`${cmd}\` in **${info.name}**\n` +
-      `pane \`${ws.pane.paneId || ws.pane.id}\`` +
-      (info.port ? ` · try \`/screenshot ${info.port}\` once it boots` : ''),
+    (seen.state === 'serving' ? `▶️ Serving ${seen.url}` : `▶️ Started \`${cmd}\``) +
+      ` in **${info.name}**\npane \`${paneId}\`` +
+      (port ? ` · \`/screenshot ${port}\`` : ''),
   );
 }
 
@@ -676,7 +696,13 @@ const BUTTON_KEYS = {
 
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton()) return;
-  const [action, paneId] = (interaction.customId || '').split(':');
+  // Pane ids contain a colon themselves (`w1D:p1`), so split on the first one
+  // only — splitting on all of them hands herdr a workspace id and it rightly
+  // answers "agent target w1D not found".
+  const raw = interaction.customId || '';
+  const cut = raw.indexOf(':');
+  const action = cut < 0 ? '' : raw.slice(0, cut);
+  const paneId = cut < 0 ? '' : raw.slice(cut + 1);
   if (!action || !paneId) return;
 
   if (interaction.guildId !== GUILD_ID || interaction.user.id !== effectiveOwnerId) {

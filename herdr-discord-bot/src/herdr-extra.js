@@ -415,6 +415,25 @@ async function splitPane({
 
 // ---- Creating an agent from scratch ---------------------------------------
 
+// A pane herdr has only just created can still be settling its shell, and
+// `agent start` reports that as `agent_pane_busy`. That is a race, not a
+// refusal, so retry it briefly. Any other failure is returned untouched.
+const PANE_BUSY = /agent_pane_busy|not an available shell/i;
+
+async function retryWhilePaneBusy(fn, { attempts = 6, waitMs = 750 } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (!PANE_BUSY.test(err.message || '')) throw err;
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+  }
+  throw lastErr;
+}
+
 // herdr requires the name to be unique among *live* agents.
 async function generateAgentName(agentType) {
   let taken = new Set();
@@ -535,7 +554,15 @@ async function newAgent({
   try {
     // `agent start` blocks until the agent is interactive; give exec headroom
     // beyond herdr's own startup timeout so we surface herdr's error, not ours.
-    data = await runHerdrJson(args, { timeoutMs: startupTimeout + 15000 });
+    //
+    // `workspace create` returns once the pane exists, which is a moment before
+    // its shell is ready to be handed to an agent. Starting straight after
+    // therefore loses a race now and then — herdr answers `agent_pane_busy` for
+    // a pane it has only just made. Wait it out rather than tearing down a
+    // perfectly good workspace.
+    data = await retryWhilePaneBusy(() =>
+      runHerdrJson(args, { timeoutMs: startupTimeout + 15000 }),
+    );
   } catch (err) {
     await rollback(created);
     throw err;
