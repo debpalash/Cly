@@ -17,6 +17,7 @@ const {
   ButtonStyle,
   MessageType,
 } = require('discord.js');
+const { execFile } = require('node:child_process');
 const herdr = require('./herdr');
 const { Dashboard } = require('./dashboard');
 const { extractAnswer } = require('./answer');
@@ -158,6 +159,7 @@ class Sync {
     this.outputLines = Number(process.env.OUTPUT_LINES || 25);
     this.typing = new Set(); // paneIds currently shown as "typing"
     this.typingTimer = null;
+    this.projectKeys = new Map(); // cwd -> git root (project identity)
     this.lastKeepAlive = 0; // last un-archive sweep
     this.keepAliveMs = Number(process.env.KEEPALIVE_MS || 300000); // 5 min
     this.parts = new Map(); // paneId -> last transcript part number
@@ -287,6 +289,95 @@ class Sync {
     return cat;
   }
 
+  // A project is identified by its git root, so agents working in different
+  // subdirectories of one repo still share a channel. Falls back to the cwd for
+  // non-git directories. Cached: this shells out.
+  async #projectKey(cwd) {
+    if (!cwd) return 'unknown';
+    if (this.projectKeys.has(cwd)) return this.projectKeys.get(cwd);
+    const key = await new Promise((resolve) => {
+      execFile(
+        'git',
+        ['-C', cwd, 'rev-parse', '--show-toplevel'],
+        { timeout: 5000 },
+        (err, stdout) => resolve(err ? cwd : stdout.trim() || cwd),
+      );
+    });
+    this.projectKeys.set(cwd, key);
+    return key;
+  }
+
+  async #ensureProjectChannel(projectKey, agents) {
+    const cached = this.channels.get(projectKey);
+    if (cached) {
+      const ch = await this.guild.channels.fetch(cached).catch(() => null);
+      if (ch) return ch;
+      this.channels.delete(projectKey);
+    }
+    const persisted = this.store?.getChannelForWorkspace?.(projectKey);
+    if (persisted) {
+      const ch = await this.guild.channels.fetch(persisted).catch(() => null);
+      if (ch) {
+        this.channels.set(projectKey, ch.id);
+        return ch;
+      }
+    }
+
+    const name = clampName(
+      (projectKey.split('/').filter(Boolean).pop() || 'project')
+        .toLowerCase()
+        .replace(/[^a-z0-9-]+/g, '-'),
+      90,
+    );
+
+    const all = await this.guild.channels.fetch();
+    let ch = all.find((c) => c && c.type === ChannelType.GuildText && c.name === name);
+
+    // Adopt a channel left over from the old per-workspace naming
+    // ("opal-wt") instead of creating a duplicate beside it. Prefer the one
+    // that already holds the most threads so the most history survives.
+    if (!ch) {
+      const cat = await this.#ensureCategory();
+      const legacyRe = new RegExp(`^${name}-[a-z0-9]{1,3}$`, 'i');
+      const legacy = [...all.values()].filter(
+        (c) =>
+          c &&
+          c.type === ChannelType.GuildText &&
+          c.parentId === cat.id &&
+          legacyRe.test(c.name),
+      );
+      if (legacy.length) {
+        let best = legacy[0];
+        let bestCount = -1;
+        for (const c of legacy) {
+          const t = await c.threads.fetch().catch(() => null);
+          const n = t ? t.threads.size : 0;
+          if (n > bestCount) {
+            bestCount = n;
+            best = c;
+          }
+        }
+        ch = await best.setName(name).catch(() => best);
+        this.log.info?.(`[sync] adopted ${legacy.length} legacy channel(s) as #${name}`);
+      }
+    }
+
+    if (!ch) {
+      const cat = await this.#ensureCategory();
+      ch = await this.guild.channels.create({
+        name,
+        type: ChannelType.GuildText,
+        parent: cat.id,
+        topic: `${projectKey} — one thread per agent. Type in a thread to prompt that agent.`,
+      });
+      this.log.info?.(`[sync] created channel #${name} for ${projectKey}`);
+    }
+
+    this.channels.set(projectKey, ch.id);
+    this.store?.setChannelForWorkspace?.(projectKey, ch.id);
+    return ch;
+  }
+
   async #ensureWorkspaceChannel(wsId, agents) {
     if (this.channels.has(wsId)) {
       const cached = await this.guild.channels.fetch(this.channels.get(wsId)).catch(() => null);
@@ -402,20 +493,23 @@ class Sync {
     const agents = await herdr.listAgents();
     const seen = new Set();
 
-    // group by workspace
-    const byWs = new Map();
+    // Group by PROJECT, not workspace. One project routinely spans several
+    // herdr workspaces (Opal sits in wS and wT), and a channel per workspace
+    // splits one project's agents across duplicate channels.
+    const byProject = new Map();
     for (const a of agents) {
       seen.add(a.paneId);
-      if (!byWs.has(a.workspaceId)) byWs.set(a.workspaceId, []);
-      byWs.get(a.workspaceId).push(a);
+      const key = await this.#projectKey(a.cwd);
+      if (!byProject.has(key)) byProject.set(key, []);
+      byProject.get(key).push(a);
     }
 
-    for (const [wsId, list] of byWs) {
+    for (const [projectKey, list] of byProject) {
       let channel;
       try {
-        channel = await this.#ensureWorkspaceChannel(wsId, list);
+        channel = await this.#ensureProjectChannel(projectKey, list);
       } catch (e) {
-        this.log.error(`[sync] channel for ${wsId} failed:`, e.message);
+        this.log.error(`[sync] channel for ${projectKey} failed:`, e.message);
         continue;
       }
 
@@ -478,7 +572,7 @@ class Sync {
       }
 
       // The channel's own index, refreshed after its agents are settled.
-      await this.#renderPanel(channel, wsId, list).catch(() => {});
+      await this.#renderPanel(channel, projectKey, list).catch(() => {});
     }
 
     // agents that disappeared
@@ -599,7 +693,7 @@ class Sync {
 
   // One embed per workspace channel, edited in place: the channel's own live
   // index of its agents, so the channel body reads as a panel not a log.
-  async #renderPanel(channel, wsId, agents) {
+  async #renderPanel(channel, projectKey, agents) {
     const rank = { blocked: 0, working: 1, done: 2, idle: 3, unknown: 4 };
     const sorted = [...agents].sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
     const gid = this.guild.id;
@@ -611,15 +705,18 @@ class Sync {
       const link = tid
         ? `[\`${a.paneId}\`](https://discord.com/channels/${gid}/${tid})`
         : `\`${a.paneId}\``;
-      return `${e} ${link} · ${label}`;
+      // Several workspaces can feed one project, so show which one an agent
+      // lives in — otherwise two identical rows are indistinguishable.
+      return `${e} ${link} · ${label} · \`${a.workspaceId}\``;
     });
 
     const counts = sorted.reduce((m, a) => ((m[a.status] = (m[a.status] || 0) + 1), m), {});
-    const project = sorted[0]?.cwd.split('/').filter(Boolean).pop() || wsId;
+    const project = projectKey.split('/').filter(Boolean).pop() || 'project';
+    const workspaces = [...new Set(sorted.map((a) => a.workspaceId))];
     const color = counts.blocked ? 0xed4245 : counts.working ? 0xfaa61a : 0x57f287;
 
     const embed = new EmbedBuilder()
-      .setTitle(`${project} · workspace ${wsId}`)
+      .setTitle(`${project} · ${workspaces.length} workspace${workspaces.length === 1 ? '' : 's'}`)
       .setDescription(lines.join('\n') || '_no agents_')
       .setColor(color)
       .setFooter({
