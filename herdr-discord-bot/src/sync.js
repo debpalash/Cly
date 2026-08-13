@@ -490,7 +490,13 @@ class Sync {
 
   async #tickOnce() {
     if (!this.running) return;
+    // Phase timings, so a pass that stalls says where rather than going silent.
+    const t0 = Date.now();
+    const trace = (msg) => {
+      if (process.env.SYNC_TRACE === '1') this.log.info?.(`[sync] ${Date.now() - t0}ms ${msg}`);
+    };
     const agents = await herdr.listAgents();
+    trace(`listAgents ${agents.length}`);
     const seen = new Set();
 
     // Group by PROJECT, not workspace. One project routinely spans several
@@ -504,10 +510,13 @@ class Sync {
       byProject.get(key).push(a);
     }
 
+    trace(`grouped into ${byProject.size} projects`);
+
     for (const [projectKey, list] of byProject) {
       let channel;
       try {
         channel = await this.#ensureProjectChannel(projectKey, list);
+        trace(`channel ready ${projectKey}`);
       } catch (e) {
         this.log.error(`[sync] channel for ${projectKey} failed:`, e.message);
         continue;
@@ -573,7 +582,9 @@ class Sync {
 
       // The channel's own index, refreshed after its agents are settled.
       await this.#renderPanel(channel, projectKey, list).catch(() => {});
+      trace(`panel done ${projectKey}`);
     }
+    trace('all projects done');
 
     // agents that disappeared
     for (const paneId of Array.from(this.prev.keys())) {
@@ -601,7 +612,9 @@ class Sync {
     // its maximum. Most agents sit idle, so without this their threads quietly
     // drop out of the sidebar and the panel decays with no error anywhere.
     // Keep every live agent's thread un-archived.
+    trace('starting keepAlive');
     await this.#keepThreadsAlive(seen);
+    trace('keepAlive done');
 
     // Refresh the live panel with the full picture.
     if (this.dashboard) {
